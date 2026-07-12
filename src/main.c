@@ -25,8 +25,8 @@ static void usage(const char *argv0)
            "for Intel Xeon and AMD EPYC systems.\n\n"
            "usage: %s [options]\n"
            "  -d SEC    refresh interval in seconds (default 1.5)\n"
-           "  -A        render with raw ANSI escape codes instead of ncurses\n"
-           "            (automatic when the terminal cannot be initialized)\n"
+           "  -N        render with ncurses (default: built-in ANSI renderer,\n"
+           "            which needs no terminfo and works on any terminal)\n"
            "  -b        batch mode: plain-text output, no TUI (for logging)\n"
            "  -n N      batch mode: exit after N intervals\n"
            "  -t ROWS   batch mode: top-N processes to print (default 10)\n"
@@ -108,6 +108,10 @@ static void batch_print(struct snapshot *s, int top)
     strftime(tbuf, sizeof tbuf, "%H:%M:%S", localtime(&now));
 
     printf("=== %s  dt=%.2fs ===\n", tbuf, s->dt);
+    if (!s->trace_ok)
+        printf("setup: flush attribution OFFLINE: %s\n", s->trace_err);
+    if (!s->pmu_ok)
+        printf("setup: PMU counters OFFLINE: %s\n", s->pmu_err);
     printf("tlb_recv_ipi/s %.0f  resched_ipi/s %.0f  call_ipi/s %.0f",
            s->proc.tlb_recv_tot, s->proc.res_tot, s->proc.cal_tot);
     if (s->trace_ok) {
@@ -198,14 +202,15 @@ static void batch_print(struct snapshot *s, int top)
 int main(int argc, char **argv)
 {
     double delay = 1.5;
-    bool batch = false, use_ansi = false;
+    bool batch = false, use_ansi = true;
     int iterations = -1, top = 10, opt;
 
-    while ((opt = getopt(argc, argv, "d:bn:t:AVh")) != -1) {
+    while ((opt = getopt(argc, argv, "d:bn:t:ANVh")) != -1) {
         switch (opt) {
         case 'd': delay = atof(optarg); if (delay < 0.2) delay = 0.2; break;
         case 'b': batch = true; break;
-        case 'A': use_ansi = true; break;
+        case 'A': use_ansi = true; break;      /* kept for compatibility */
+        case 'N': use_ansi = false; break;
         case 'n': iterations = atoi(optarg); break;
         case 't': top = atoi(optarg); break;
         case 'V': printf("TLBanalyser %s\n", TLBA_VERSION); return 0;
@@ -216,8 +221,10 @@ int main(int argc, char **argv)
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
+    /* ncurses is opt-in (-N): some hosts ship curses substitutes whose
+     * initscr() kills the process even when the setupterm probe passes */
     if (!batch && !use_ansi && !terminfo_setup()) {
-        fprintf(stderr, "tlbanalyser: falling back to the raw ANSI renderer\n");
+        fprintf(stderr, "tlbanalyser: falling back to the built-in ANSI renderer\n");
         use_ansi = true;
     }
 

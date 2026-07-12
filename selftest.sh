@@ -15,7 +15,20 @@ echo "== TLBanalyser self-test =="
 [ "$(id -u)" = 0 ] || { echo "must run as root"; exit 1; }
 
 echo "-- environment"
-info "kernel $(uname -r), $(nproc) CPUs, $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')"
+online=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc)
+allowed=$(nproc)
+info "kernel $(uname -r), CPUs online: $online, allowed to this shell: $allowed"
+info "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')"
+if [ "$allowed" -lt 2 ]; then
+    warn "this shell is confined to $allowed CPU(s) (cpuset/taskset) - remote TLB"
+    warn "shootdowns can neither be generated nor meaningfully observed from here;"
+    warn "escape the confinement (e.g. 'taskset -c 0-$((online-1)) bash') and re-run"
+fi
+if grep -qw invlpgb /proc/cpuinfo; then
+    warn "CPU supports AMD INVLPGB broadcast TLB invalidation: on recent kernels"
+    warn "remote flushes bypass IPIs entirely, so TLB/CAL interrupt rows can be"
+    warn "legitimately ~0 - rely on the tracepoint attribution, not IPI counts"
+fi
 virt=$(systemd-detect-virt 2>/dev/null); [ -n "${virt:-}" ] && [ "$virt" != none ] && info "virtualization: $virt"
 cont=$(systemd-detect-virt -c 2>/dev/null); [ -n "${cont:-}" ] && [ "$cont" != none ] && \
     warn "running inside a container ($cont) - tracefs/PMU may be blocked by the runtime"
@@ -53,6 +66,11 @@ fi
 info "baseline shootdown IPIs: ${base_recv}/s"
 
 echo "-- storm: known workload must be caught and attributed"
+if [ "$allowed" -lt 2 ]; then
+    warn "storm test SKIPPED: this shell only has $allowed CPU(s); fix the confinement and re-run"
+    echo "== result: $PASS passed, $FAIL failed, $WARN warnings =="
+    exit 1
+fi
 ./test/shootgen 10 > /tmp/shootgen.$$ &
 GEN=$!
 sleep 1

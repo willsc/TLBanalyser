@@ -23,6 +23,8 @@ static void usage(const char *argv0)
            "for Intel Xeon and AMD EPYC systems.\n\n"
            "usage: %s [options]\n"
            "  -d SEC    refresh interval in seconds (default 1.5)\n"
+           "  -A        render with raw ANSI escape codes instead of ncurses\n"
+           "            (automatic when the terminal cannot be initialized)\n"
            "  -b        batch mode: plain-text output, no TUI (for logging)\n"
            "  -n N      batch mode: exit after N intervals\n"
            "  -t ROWS   batch mode: top-N processes to print (default 10)\n"
@@ -76,11 +78,8 @@ static bool terminfo_setup(void)
             return true;
         }
     }
-    fprintf(stderr,
-        "tlbanalyser: no terminfo database found - TUI unavailable.\n"
-        "  install one:  apt-get install ncurses-base ncurses-term\n"
-        "  or keep the bundled ./terminfo directory next to the binary,\n"
-        "  or use batch mode (no terminal needed):  tlbanalyser -b -d 5\n");
+    fprintf(stderr, "tlbanalyser: curses cannot load any terminal description "
+            "on this host (broken/nonstandard terminfo)\n");
     return false;
 }
 
@@ -152,13 +151,14 @@ static void batch_print(struct snapshot *s, int top)
 int main(int argc, char **argv)
 {
     double delay = 1.5;
-    bool batch = false;
+    bool batch = false, use_ansi = false;
     int iterations = -1, top = 10, opt;
 
-    while ((opt = getopt(argc, argv, "d:bn:t:Vh")) != -1) {
+    while ((opt = getopt(argc, argv, "d:bn:t:AVh")) != -1) {
         switch (opt) {
         case 'd': delay = atof(optarg); if (delay < 0.2) delay = 0.2; break;
         case 'b': batch = true; break;
+        case 'A': use_ansi = true; break;
         case 'n': iterations = atoi(optarg); break;
         case 't': top = atoi(optarg); break;
         case 'V': printf("TLBanalyser %s\n", TLBA_VERSION); return 0;
@@ -169,7 +169,10 @@ int main(int argc, char **argv)
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
 
-    if (!batch && !terminfo_setup()) return 1;
+    if (!batch && !use_ansi && !terminfo_setup()) {
+        fprintf(stderr, "tlbanalyser: falling back to the raw ANSI renderer\n");
+        use_ansi = true;
+    }
 
     static struct topology topo;
     topology_read(&topo);
@@ -189,7 +192,7 @@ int main(int argc, char **argv)
     int cur = 0;
     proc_sample_read(&ps[cur], topo.ncpu);
 
-    if (!batch) ui_init();
+    if (!batch) ui_init(use_ansi);
 
     double t_start = now_s(), t_last = t_start;
     bool have_frame = false;
@@ -227,8 +230,8 @@ int main(int argc, char **argv)
         if (batch) {
             usleep(50 * 1000);
         } else {
-            int ch = getch();               /* 50ms timeout = drain cadence */
-            if (ch == ERR) continue;
+            int ch = ui_getch();            /* waits <=50ms */
+            if (ch < 0) continue;
             int act = ui_key(ch);
             if (act == 1) break;
             if (act == 2 && ts) trace_reset_cum(ts);

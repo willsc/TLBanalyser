@@ -83,10 +83,12 @@ sudo ./tlbanalyser -b -n 12 -d 5 > tlb.log   # one minute capture
 Requires root (or `CAP_PERFMON` + `CAP_SYS_ADMIN`) for the PMU and
 tracepoint. Without them, `/proc`-based panels still work.
 
-Hosts without a terminfo database (minimal cloud images): the tool
-automatically falls back to the compiled entries bundled in `./terminfo`
-(searched relative to the binary), then to simpler `$TERM` values, and tells
-you if the TUI is impossible — batch mode (`-b`) never needs a terminal.
+Hosts with a broken or nonstandard curses/terminfo setup (seen on some
+minimal cloud images): the tool first retries with the compiled terminfo
+entries bundled in `./terminfo`, and if curses still cannot initialize it
+automatically switches to a built-in raw ANSI/VT100 renderer (`-A` forces
+it) — same layout, same colors, no terminfo needed at all. Batch mode
+(`-b`) never needs a terminal.
 
 Keys: `F1` help · `F5`/`s` sort (SEND, TOTAL, RECV, ΣSEND) · `c` cumulative ·
 `p` pause · `m` compact CPU grid · `r` reset cumulative · arrows/PgUp/PgDn

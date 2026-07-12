@@ -174,8 +174,9 @@ struct snapshot {
 extern const char *tlb_reason_name[REASON_MAX];
 extern const char *tlb_reason_short[REASON_MAX];
 
-void ui_init(void);
+void ui_init(bool use_ansi);  /* ansi = raw VT100 backend, no curses runtime */
 void ui_done(void);
+int  ui_getch(void);          /* waits <=50ms; returns key or -1 */
 int  ui_key(int ch);          /* 0 none, 1 quit, 2 reset cumulative */
 bool ui_paused(void);
 void ui_draw(struct snapshot *s);

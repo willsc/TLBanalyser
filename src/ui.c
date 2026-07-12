@@ -1,14 +1,29 @@
-/* htop-style ncurses front-end */
+/*
+ * htop-style front-end with two rendering backends sharing one draw path:
+ *  - ncurses (default)
+ *  - raw ANSI/VT100 escape codes (-A, or automatic when the host's curses
+ *    cannot initialize a terminal - e.g. broken/absent terminfo databases)
+ */
 #include "tlba.h"
 #include <ncurses.h>
 #include <math.h>
+#include <stdarg.h>
+#include <termios.h>
+#include <poll.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
 
 enum { CP_LABEL = 1, CP_USER, CP_SYS, CP_IRQ, CP_SOFTIRQ, CP_NICE,
        CP_FKEY, CP_TABHDR, CP_SEL, CP_HEAT_LO, CP_HEAT_MID, CP_HEAT_HI,
-       CP_TITLE, CP_WARN };
+       CP_TITLE, CP_WARN, CP__N };
+
+/* attribute byte: pair index + bold/dim flags */
+#define AT_BOLD 0x40u
+#define AT_DIM  0x80u
+#define AT_PAIR(a) ((a) & 0x3fu)
 
 enum sort_mode { SORT_SEND = 0, SORT_TOTAL, SORT_RECV, SORT_CUMSEND, SORT__N };
-static const char *sort_name[SORT__N] = { "SEND/s", "TOTAL/s", "RECV/s", "ΣSEND" };
+static const char *sort_name[SORT__N] = { "SEND/s", "TOTAL/s", "RECV/s", "cumSEND" };
 
 static struct {
     int  sort;
@@ -19,14 +34,196 @@ static struct {
     bool cumulative;    /* show cumulative counts in table */
 } st;
 
-void ui_init(void)
+static bool ansi;
+
+/* ================= ANSI grid backend ================= */
+
+#define G_MAXR 200
+#define G_MAXC 500
+static struct cell { char ch; unsigned char at; } grid[G_MAXR][G_MAXC];
+static int g_rows = 24, g_cols = 80;
+static struct termios g_tio_save;
+static bool g_tio_saved;
+
+/* pair -> SGR color codes (fg, bg; 0 = default) */
+static const struct { unsigned char fg, bg; } sgr_pair[CP__N] = {
+    [0]           = {  0,  0 },
+    [CP_LABEL]    = { 36,  0 }, [CP_USER]     = { 32,  0 },
+    [CP_SYS]      = { 31,  0 }, [CP_IRQ]      = { 33,  0 },
+    [CP_SOFTIRQ]  = { 35,  0 }, [CP_NICE]     = { 34,  0 },
+    [CP_FKEY]     = { 30, 46 }, [CP_TABHDR]   = { 30, 42 },
+    [CP_SEL]      = { 30, 46 }, [CP_HEAT_LO]  = { 32,  0 },
+    [CP_HEAT_MID] = { 33,  0 }, [CP_HEAT_HI]  = { 31,  0 },
+    [CP_TITLE]    = { 30, 46 }, [CP_WARN]     = { 31,  0 },
+};
+
+static void g_getsize(void)
 {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
+        g_cols = ws.ws_col;
+        g_rows = ws.ws_row;
+    }
+    if (g_cols > G_MAXC) g_cols = G_MAXC;
+    if (g_rows > G_MAXR) g_rows = G_MAXR;
+}
+
+static void g_clear(void)
+{
+    for (int y = 0; y < g_rows; y++)
+        for (int x = 0; x < g_cols; x++) {
+            grid[y][x].ch = ' ';
+            grid[y][x].at = 0;
+        }
+}
+
+static char g_out[2 * 1024 * 1024];
+
+static void g_emit(void)
+{
+    size_t o = 0;
+    o += (size_t)snprintf(g_out + o, sizeof g_out - o, "\x1b[H");
+    unsigned cur = 0xffu;
+    for (int y = 0; y < g_rows; y++) {
+        o += (size_t)snprintf(g_out + o, sizeof g_out - o, "\x1b[%d;1H", y + 1);
+        int last = g_cols - 1;
+        while (last > 0 && grid[y][last].ch == ' ' && grid[y][last].at == 0) last--;
+        for (int x = 0; x <= last && o < sizeof g_out - 24; x++) {
+            unsigned at = grid[y][x].at;
+            if (at != cur) {
+                unsigned p = AT_PAIR(at);
+                o += (size_t)snprintf(g_out + o, sizeof g_out - o, "\x1b[0%s%s",
+                                      (at & AT_BOLD) ? ";1" : "",
+                                      (at & AT_DIM) ? ";2" : "");
+                if (p && sgr_pair[p].fg)
+                    o += (size_t)snprintf(g_out + o, sizeof g_out - o, ";%d", sgr_pair[p].fg);
+                if (p && sgr_pair[p].bg)
+                    o += (size_t)snprintf(g_out + o, sizeof g_out - o, ";%d", sgr_pair[p].bg);
+                g_out[o++] = 'm';
+                cur = at;
+            }
+            g_out[o++] = grid[y][x].ch;
+        }
+        if (cur != 0) {
+            o += (size_t)snprintf(g_out + o, sizeof g_out - o, "\x1b[0m");
+            cur = 0;
+        }
+        o += (size_t)snprintf(g_out + o, sizeof g_out - o, "\x1b[K");
+    }
+    o += (size_t)snprintf(g_out + o, sizeof g_out - o, "\x1b[0m");
+    ssize_t r = write(STDOUT_FILENO, g_out, o);
+    (void)r;
+}
+
+/* ================= drawing primitives (both backends) ================= */
+
+static int P_rows(void) { return ansi ? g_rows : LINES; }
+static int P_cols(void) { return ansi ? g_cols : COLS; }
+
+static attr_t nc_attr(unsigned at)
+{
+    return (attr_t)(COLOR_PAIR(AT_PAIR(at)) |
+                    ((at & AT_BOLD) ? A_BOLD : 0) |
+                    ((at & AT_DIM) ? A_DIM : 0));
+}
+
+static void P_putc(int y, int x, unsigned at, char ch)
+{
+    if (y < 0 || x < 0 || y >= P_rows() || x >= P_cols()) return;
+    if (ansi) {
+        grid[y][x].ch = ch;
+        grid[y][x].at = (unsigned char)at;
+    } else {
+        attr_t a = nc_attr(at);
+        attron(a);
+        mvaddch(y, x, (chtype)ch);
+        attroff(a);
+    }
+}
+
+/* printf at position; clips to width; returns x after the text */
+static int P_print(int y, int x, unsigned at, const char *fmt, ...)
+{
+    char buf[G_MAXC + 1];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    int len = (int)strlen(buf);
+    if (y < 0 || y >= P_rows()) return x + len;
+    if (ansi) {
+        for (int i = 0; i < len; i++) {
+            int xx = x + i;
+            if (xx < 0 || xx >= g_cols) continue;
+            grid[y][xx].ch = buf[i];
+            grid[y][xx].at = (unsigned char)at;
+        }
+    } else {
+        int w = P_cols() - x;
+        if (w > 0) {
+            attr_t a = nc_attr(at);
+            attron(a);
+            mvaddnstr(y, x, buf, w);
+            attroff(a);
+        }
+    }
+    return x + len;
+}
+
+static void P_hline(int y, int x, int w, unsigned at)
+{
+    if (ansi) {
+        for (int i = 0; i < w; i++) P_putc(y, x + i, at, '-');
+    } else {
+        attr_t a = nc_attr(at);
+        attron(a);
+        for (int i = 0; i < w && x + i < COLS; i++) mvaddch(y, x + i, ACS_HLINE);
+        attroff(a);
+    }
+}
+
+static void P_frame_begin(void)
+{
+    if (ansi) {
+        g_getsize();
+        g_clear();
+    } else {
+        erase();
+    }
+}
+
+static void P_frame_end(void)
+{
+    if (ansi) g_emit();
+    else refresh();
+}
+
+/* ================= init / input ================= */
+
+void ui_init(bool use_ansi)
+{
+    ansi = use_ansi;
+    if (ansi) {
+        if (tcgetattr(STDIN_FILENO, &g_tio_save) == 0) {
+            g_tio_saved = true;
+            struct termios t = g_tio_save;
+            t.c_lflag &= ~(tcflag_t)(ICANON | ECHO);
+            t.c_cc[VMIN] = 0;
+            t.c_cc[VTIME] = 0;
+            tcsetattr(STDIN_FILENO, TCSANOW, &t);
+        }
+        /* alt screen, hide cursor */
+        ssize_t r = write(STDOUT_FILENO, "\x1b[?1049h\x1b[?25l\x1b[2J", 18);
+        (void)r;
+        g_getsize();
+        return;
+    }
     initscr();
     cbreak();
     noecho();
     curs_set(0);
     keypad(stdscr, TRUE);
-    timeout(50);            /* getch timeout doubles as ring drain cadence */
+    timeout(50);            /* getch timeout doubles as UI pacing */
     if (has_colors()) {
         start_color();
         use_default_colors();
@@ -47,7 +244,58 @@ void ui_init(void)
     }
 }
 
-void ui_done(void) { endwin(); }
+void ui_done(void)
+{
+    if (ansi) {
+        ssize_t r = write(STDOUT_FILENO, "\x1b[0m\x1b[?25h\x1b[?1049l", 18);
+        (void)r;
+        if (g_tio_saved) tcsetattr(STDIN_FILENO, TCSANOW, &g_tio_save);
+        return;
+    }
+    endwin();
+}
+
+/* blocking up to ~50ms; returns key or -1 */
+int ui_getch(void)
+{
+    if (!ansi) {
+        int ch = getch();
+        return ch == ERR ? -1 : ch;
+    }
+    struct pollfd pf = { .fd = STDIN_FILENO, .events = POLLIN };
+    if (poll(&pf, 1, 50) <= 0) return -1;
+    unsigned char c;
+    if (read(STDIN_FILENO, &c, 1) != 1) return -1;
+    if (c != 0x1b) return c;
+    /* escape sequence: arrows / pgup / pgdn / home / F-keys */
+    unsigned char seq[4] = {0};
+    struct pollfd p2 = { .fd = STDIN_FILENO, .events = POLLIN };
+    if (poll(&p2, 1, 10) <= 0) return 0x1b;
+    if (read(STDIN_FILENO, seq, 1) != 1) return 0x1b;
+    if (seq[0] == 'O') {                       /* SS3: F1-F4 */
+        if (read(STDIN_FILENO, seq + 1, 1) != 1) return -1;
+        if (seq[1] == 'P') return 'h';         /* F1 = help */
+        return -1;
+    }
+    if (seq[0] != '[') return -1;
+    if (read(STDIN_FILENO, seq + 1, 1) != 1) return -1;
+    switch (seq[1]) {
+    case 'A': return KEY_UP;
+    case 'B': return KEY_DOWN;
+    case 'H': return KEY_HOME;
+    case '5': case '6': case '1': {
+        unsigned char rest[3] = {0};
+        if (read(STDIN_FILENO, rest, 1) != 1) return -1;
+        if (seq[1] == '5' && rest[0] == '~') return KEY_PPAGE;
+        if (seq[1] == '6' && rest[0] == '~') return KEY_NPAGE;
+        if (seq[1] == '1' && rest[0] == '5') {  /* ESC [ 1 5 ~  = F5 */
+            if (read(STDIN_FILENO, rest + 1, 1) == 1 && rest[1] == '~') return 's';
+        }
+        return -1;
+    }
+    }
+    return -1;
+}
 
 /* returns: 0 none, 1 quit, 2 reset-cumulative */
 int ui_key(int ch)
@@ -101,42 +349,30 @@ static void draw_cpu_meter(int y, int x, int w, int cpu, const struct cpu_load *
 {
     int inner = w - 8;                        /* label(3) + [ ] */
     if (inner < 6) return;
-    attron(COLOR_PAIR(CP_LABEL));
-    mvprintw(y, x, "%3d", cpu);
-    attroff(COLOR_PAIR(CP_LABEL));
-    attron(A_BOLD);
-    mvaddch(y, x + 3, '[');
-    mvaddch(y, x + 3 + inner + 1, ']');
-    attroff(A_BOLD);
+    P_print(y, x, CP_LABEL, "%3d", cpu);
+    P_putc(y, x + 3, AT_BOLD, '[');
+    P_putc(y, x + 3 + inner + 1, AT_BOLD, ']');
 
-    struct { float v; int cp; } seg[] = {
+    struct { float v; unsigned at; } seg[] = {
         { l->nice, CP_NICE }, { l->user, CP_USER }, { l->system, CP_SYS },
         { l->irq, CP_IRQ }, { l->softirq, CP_SOFTIRQ }, { l->steal, CP_IRQ },
     };
     int pos = 0;
     for (size_t i = 0; i < sizeof seg / sizeof seg[0]; i++) {
-        int n = (int)lroundf(seg[i].v * inner);
+        int n = (int)lroundf(seg[i].v * (float)inner);
         if (pos + n > inner) n = inner - pos;
-        if (n <= 0) continue;
-        attron(COLOR_PAIR(seg[i].cp));
-        for (int k = 0; k < n; k++) mvaddch(y, x + 4 + pos + k, '|');
-        attroff(COLOR_PAIR(seg[i].cp));
-        pos += n;
+        for (int k = 0; k < n; k++) P_putc(y, x + 4 + pos + k, seg[i].at, '|');
+        if (n > 0) pos += n;
     }
     char pct[8];
     snprintf(pct, sizeof pct, "%.1f%%", l->busy * 100.0);
-    int px = x + 4 + inner - (int)strlen(pct);
-    attron(A_DIM);
-    mvprintw(y, px, "%s", pct);
-    attroff(A_DIM);
+    P_print(y, x + 4 + inner - (int)strlen(pct), AT_DIM, "%s", pct);
 }
 
 /* heat strip: one cell per CPU (or aggregated), colored by value/max */
 static void draw_heat(int y, int x, int w, const double *val, int n, double lo, double hi)
 {
-    attron(A_BOLD);
-    mvaddch(y, x, '[');
-    attroff(A_BOLD);
+    P_putc(y, x, AT_BOLD, '[');
     int cells = w - 2;
     if (cells < 1) return;
     int per = (n + cells - 1) / cells;        /* CPUs per cell */
@@ -151,31 +387,20 @@ static void draw_heat(int y, int x, int w, const double *val, int n, double lo, 
         if (f < 0) f = 0;
         if (f > 1) f = 1;
         int g = (int)(f * 9.0);
-        int cp = f < 0.4 ? CP_HEAT_LO : f < 0.75 ? CP_HEAT_MID : CP_HEAT_HI;
-        attron(COLOR_PAIR(cp) | (g >= 7 ? A_BOLD : 0));
-        mvaddch(y, x + 1 + c, (chtype)glyph[g]);
-        attroff(COLOR_PAIR(cp) | A_BOLD);
+        unsigned at = (f < 0.4 ? CP_HEAT_LO : f < 0.75 ? CP_HEAT_MID : CP_HEAT_HI) |
+                      (g >= 7 ? AT_BOLD : 0);
+        P_putc(y, x + 1 + c, at, glyph[g]);
     }
-    for (int c = used; c < cells; c++) mvaddch(y, x + 1 + c, ' ');
-    attron(A_BOLD);
-    mvaddch(y, x + 1 + cells, ']');
-    attroff(A_BOLD);
+    P_putc(y, x + 1 + cells, AT_BOLD, ']');
 }
 
 static void section(int y, const char *title)
 {
-    attron(COLOR_PAIR(CP_LABEL) | A_BOLD);
-    mvprintw(y, 0, "%s", title);
-    attroff(COLOR_PAIR(CP_LABEL) | A_BOLD);
-    attron(A_DIM);
-    int x = (int)strlen(title) + 1;
-    for (int i = x; i < COLS; i++) mvaddch(y, i, ACS_HLINE);
-    attroff(A_DIM);
+    P_print(y, 0, CP_LABEL | AT_BOLD, "%s", title);
+    P_hline(y, (int)strlen(title) + 1, P_cols() - (int)strlen(title) - 1, AT_DIM);
 }
 
 /* ---------- table sorting ---------- */
-
-static const struct snapshot *g_snap;
 
 static double row_key(const struct pid_stat *p)
 {
@@ -236,56 +461,48 @@ static void draw_help(void)
     };
     int n = (int)(sizeof txt / sizeof txt[0]);
     int w = 74, h = n + 2;
-    int y0 = (LINES - h) / 2, x0 = (COLS - w) / 2;
+    int y0 = (P_rows() - h) / 2, x0 = (P_cols() - w) / 2;
     if (y0 < 0) y0 = 0;
     if (x0 < 0) x0 = 0;
-    for (int y = 0; y < h && y0 + y < LINES; y++) {
-        move(y0 + y, x0);
-        for (int x = 0; x < w && x0 + x < COLS; x++) addch(' ');
+    for (int y = 0; y < h && y0 + y < P_rows(); y++)
+        for (int x = 0; x < w && x0 + x < P_cols(); x++)
+            P_putc(y0 + y, x0 + x, 0, ' ');
+    for (int i = 0; i < n && y0 + 1 + i < P_rows(); i++)
+        P_print(y0 + 1 + i, x0 + 2, i == 0 ? AT_BOLD : 0, "%.*s", w - 4, txt[i]);
+    /* border */
+    P_hline(y0, x0, w, CP_LABEL);
+    P_hline(y0 + h - 1, x0, w, CP_LABEL);
+    for (int y = 0; y < h; y++) {
+        P_putc(y0 + y, x0, CP_LABEL, '|');
+        P_putc(y0 + y, x0 + w - 1, CP_LABEL, '|');
     }
-    attron(A_BOLD);
-    for (int i = 0; i < n && y0 + 1 + i < LINES; i++) {
-        if (i > 0) attroff(A_BOLD);
-        mvprintw(y0 + 1 + i, x0 + 2, "%.*s", w - 4, txt[i]);
-    }
-    /* border around the overlay */
-    attron(COLOR_PAIR(CP_LABEL));
-    mvhline(y0, x0, ACS_HLINE, w);
-    mvhline(y0 + h - 1, x0, ACS_HLINE, w);
-    mvvline(y0, x0, ACS_VLINE, h);
-    mvvline(y0, x0 + w - 1, ACS_VLINE, h);
-    mvaddch(y0, x0, ACS_ULCORNER);
-    mvaddch(y0, x0 + w - 1, ACS_URCORNER);
-    mvaddch(y0 + h - 1, x0, ACS_LLCORNER);
-    mvaddch(y0 + h - 1, x0 + w - 1, ACS_LRCORNER);
-    attroff(COLOR_PAIR(CP_LABEL));
+    P_putc(y0, x0, CP_LABEL, '+');
+    P_putc(y0, x0 + w - 1, CP_LABEL, '+');
+    P_putc(y0 + h - 1, x0, CP_LABEL, '+');
+    P_putc(y0 + h - 1, x0 + w - 1, CP_LABEL, '+');
 }
 
 /* ---------- main draw ---------- */
 
 void ui_draw(struct snapshot *s)
 {
-    g_snap = s;
-    erase();
-    int W = COLS, H = LINES, y = 0;
+    P_frame_begin();
+    int W = P_cols(), H = P_rows(), y = 0;
     char b1[32], b2[32], b3[32], b4[32];
     const struct topology *t = s->topo;
 
     /* title bar */
-    attron(COLOR_PAIR(CP_TITLE));
-    move(0, 0);
-    for (int i = 0; i < W; i++) addch(' ');
+    for (int i = 0; i < W; i++) P_putc(0, i, CP_TITLE, ' ');
     fmt_kb(t->l1d.size_kb, b1, sizeof b1);
     fmt_kb(t->l2.size_kb, b2, sizeof b2);
     fmt_kb(t->has_l3 ? t->l3.size_kb : 0, b3, sizeof b3);
-    mvprintw(0, 1, "TLBanalyser %s %s  %dC/%dT %dskt %dnode  L1d %s L2 %s/%dc%s%s%s",
-             TLBA_VERSION,
-             t->model_name[0] ? t->model_name : "unknown CPU",
-             t->ncore, t->ncpu, t->nsocket, t->nnode,
-             b1, b2, t->l2.sharing,
-             t->has_l3 ? " L3 " : "", t->has_l3 ? b3 : "",
-             st.paused ? "  [PAUSED]" : "");
-    attroff(COLOR_PAIR(CP_TITLE));
+    P_print(0, 1, CP_TITLE,
+            "TLBanalyser %s %s  %dC/%dT %dskt %dnode  L1d %s L2 %s/%dc%s%s%s",
+            TLBA_VERSION, t->model_name[0] ? t->model_name : "unknown CPU",
+            t->ncore, t->ncpu, t->nsocket, t->nnode,
+            b1, b2, t->l2.sharing,
+            t->has_l3 ? " L3 " : "", t->has_l3 ? b3 : "",
+            st.paused ? "  [PAUSED]" : "");
     y = 1;
 
     /* ---- CPU meters ---- */
@@ -303,14 +520,12 @@ void ui_draw(struct snapshot *s)
     } else {
         static double busy[MAX_CPUS];
         for (int i = 0; i < n; i++) busy[i] = s->proc.load[i].busy;
-        attron(COLOR_PAIR(CP_LABEL));
-        mvprintw(y, 0, "CPU busy ");
-        attroff(COLOR_PAIR(CP_LABEL));
+        P_print(y, 0, CP_LABEL, "CPU busy ");
         double avg = 0;
         for (int i = 0; i < n; i++) avg += busy[i];
         avg /= n > 0 ? n : 1;
         draw_heat(y, 10, W - 20, busy, n, 0, 1);
-        mvprintw(y, W - 8, "%5.1f%%", avg * 100);
+        P_print(y, W - 8, 0, "%5.1f%%", avg * 100);
         y++;
     }
 
@@ -322,14 +537,13 @@ void ui_draw(struct snapshot *s)
         section(y++, hdr);
     }
     if (!s->pmu_ok) {
-        attron(COLOR_PAIR(CP_WARN));
-        mvprintw(y++, 2, "%s", s->pmu_err);
-        attroff(COLOR_PAIR(CP_WARN));
+        P_print(y++, 2, CP_WARN, "%s", s->pmu_err);
     } else {
         static double strip[MAX_CPUS];
-        double instr_tot = 0, scaled = 0;
+        double instr_tot = 0, cyc_tot = 0, scaled = 0;
         for (int i = 0; i < n; i++) {
             instr_tot += s->pmu[i].v[EV_INSTR];
+            cyc_tot += s->pmu[i].v[EV_CYCLES];
             scaled += s->pmu[i].scaled ? 1 : 0;
         }
         if (instr_tot <= 0) instr_tot = 1;
@@ -360,14 +574,9 @@ void ui_draw(struct snapshot *s)
                     sum_d += den;
                 }
             }
-            attron(COLOR_PAIR(CP_LABEL));
-            mvprintw(y, 0, "%-9s", rows[r].lab);
-            attroff(COLOR_PAIR(CP_LABEL));
+            P_print(y, 0, CP_LABEL, "%-9s", rows[r].lab);
             if (!avail && sum_n == 0) {
-                attron(A_DIM);
-                mvprintw(y, 10, "event unavailable on this PMU");
-                attroff(A_DIM);
-                y++;
+                P_print(y++, 10, AT_DIM, "event unavailable on this PMU");
                 continue;
             }
             draw_heat(y, 10, W - 34, strip, n, 0, rows[r].hi);
@@ -382,15 +591,12 @@ void ui_draw(struct snapshot *s)
                 fmt_rate(sum_n, b1, sizeof b1);
                 snprintf(txt, sizeof txt, "%5.1f%% avg  %s/s", agg, b1);
             }
-            mvprintw(y, W - 23, "%22s", txt);
+            P_print(y, W - 23, 0, "%22s", txt);
             y++;
         }
-        attron(A_DIM);
-        mvprintw(y++, 0, "L2 event: %s%s   IPC %.2f", s->l2_desc,
-                 scaled > 0 ? "  [multiplexed]" : "",
-                 ({ double c = 0; for (int i = 0; i < n; i++) c += s->pmu[i].v[EV_CYCLES];
-                    c > 0 ? instr_tot / c : 0; }));
-        attroff(A_DIM);
+        P_print(y++, 0, AT_DIM, "L2 event: %s%s   IPC %.2f", s->l2_desc,
+                scaled > 0 ? "  [multiplexed]" : "",
+                cyc_tot > 0 ? instr_tot / cyc_tot : 0);
     }
 
     /* ---- TLB / IPI section ---- */
@@ -402,12 +608,10 @@ void ui_draw(struct snapshot *s)
             strip[i] = s->proc.tlb_recv[i];
             if (strip[i] > mx) mx = strip[i];
         }
-        attron(COLOR_PAIR(CP_LABEL));
-        mvprintw(y, 0, "recv/CPU ");
-        attroff(COLOR_PAIR(CP_LABEL));
+        P_print(y, 0, CP_LABEL, "recv/CPU ");
         draw_heat(y, 10, W - 34, strip, n, 0, mx);
         fmt_rate(s->proc.tlb_recv_tot, b1, sizeof b1);
-        mvprintw(y, W - 23, "%14s/s total", b1);
+        P_print(y, W - 23, 0, "%14s/s total", b1);
         y++;
 
         if (s->trace_ok && y < H - 3) {
@@ -418,82 +622,68 @@ void ui_draw(struct snapshot *s)
                 tot += strip[i];
                 if (strip[i] > sm) sm = strip[i];
             }
-            attron(COLOR_PAIR(CP_LABEL));
-            mvprintw(y, 0, "send/CPU ");
-            attroff(COLOR_PAIR(CP_LABEL));
+            P_print(y, 0, CP_LABEL, "send/CPU ");
             draw_heat(y, 10, W - 34, strip, n, 0, sm);
             fmt_rate(tot, b1, sizeof b1);
-            mvprintw(y, W - 23, "%14s/s total", b1);
+            P_print(y, W - 23, 0, "%14s/s total", b1);
             y++;
         }
         if (y < H - 3) {
             fmt_rate(s->proc.res_tot, b1, sizeof b1);
             fmt_rate(s->proc.cal_tot, b2, sizeof b2);
             fmt_rate((double)s->pages_tot / s->dt, b3, sizeof b3);
-            mvprintw(y, 0, "IPIs: resched %s/s  func-call %s/s   flushed pages %s/s",
-                     b1, b2, b3);
+            int x = P_print(y, 0, 0,
+                            "IPIs: resched %s/s  func-call %s/s   flushed pages %s/s",
+                            b1, b2, b3);
             if (s->trace_ok) {
                 if (s->lost) {
-                    attron(COLOR_PAIR(CP_WARN) | A_BOLD);
-                    printw("   LOST %lu attribution events!", (unsigned long)s->lost);
-                    attroff(COLOR_PAIR(CP_WARN) | A_BOLD);
+                    P_print(y, x, CP_WARN | AT_BOLD, "   LOST %lu attribution events!",
+                            (unsigned long)s->lost);
                 } else {
-                    attron(A_DIM);
-                    printw("   lost 0 (exact)");
+                    x = P_print(y, x, AT_DIM, "   lost 0 (exact)");
                     if (s->lost_ctx)
-                        printw("  ctx-drop %lu", (unsigned long)s->lost_ctx);
-                    attroff(A_DIM);
+                        P_print(y, x, AT_DIM, "  ctx-drop %lu",
+                                (unsigned long)s->lost_ctx);
                 }
             }
             y++;
         }
         if (s->trace_ok && y < H - 3) {
-            move(y, 0);
-            attron(COLOR_PAIR(CP_LABEL));
-            printw("reasons: ");
-            attroff(COLOR_PAIR(CP_LABEL));
+            int x = P_print(y, 0, CP_LABEL, "reasons: ");
             for (int r = 0; r < 6; r++) {
                 fmt_rate((double)s->reason_tot[r] / s->dt, b1, sizeof b1);
-                if (r == R_REMOTE_SEND) attron(A_BOLD);
-                printw("%s %s/s  ", tlb_reason_short[r], b1);
-                if (r == R_REMOTE_SEND) attroff(A_BOLD);
+                x = P_print(y, x, r == R_REMOTE_SEND ? AT_BOLD : 0,
+                            "%s %s/s  ", tlb_reason_short[r], b1);
             }
             y++;
         }
         if (s->trace_ok && y < H - 3 && s->norigin > 0) {
-            move(y, 0);
-            attron(COLOR_PAIR(CP_LABEL));
-            printw("origins: ");
-            attroff(COLOR_PAIR(CP_LABEL));
+            int x = P_print(y, 0, CP_LABEL, "origins: ");
             uint64_t tot = 0;
             for (int i = 0; i < s->norigin; i++) tot += s->origins[i].cnt;
             int shown = 0;
             for (int i = 0; i < s->norigin && shown < 4; i++) {
                 if (!s->origins[i].cnt) break;
-                printw("%s %.0f%%  ", trace_symname(s->ts, s->origins[i].sym),
-                       tot ? 100.0 * s->origins[i].cnt / tot : 0);
+                x = P_print(y, x, 0, "%s %.0f%%  ",
+                            trace_symname(s->ts, s->origins[i].sym),
+                            tot ? 100.0 * s->origins[i].cnt / tot : 0);
                 shown++;
             }
-            if (!shown) {
-                attron(A_DIM);
-                printw("(idle)");
-                attroff(A_DIM);
-            }
+            if (!shown) P_print(y, x, AT_DIM, "(idle)");
             y++;
         }
-        if (y < H - 3) {
+        if (y < H - 2) {
             fmt_rate(s->proc.thp_collapse, b1, sizeof b1);
             fmt_rate(s->proc.thp_split_pmd, b2, sizeof b2);
             fmt_rate(s->proc.pgmigrate, b3, sizeof b3);
             fmt_rate(s->proc.pgsteal, b4, sizeof b4);
-            attron(COLOR_PAIR(CP_LABEL));
-            mvprintw(y, 0, "drivers: ");
-            attroff(COLOR_PAIR(CP_LABEL));
             char b5[32], b6[32];
             fmt_rate(s->proc.compact_stall, b5, sizeof b5);
             fmt_rate(s->proc.numa_pte_updates, b6, sizeof b6);
-            printw("THPcollapse %s/s  PMDsplit %s/s  migrate %s/s  reclaim %s/s  "
-                   "compactstall %s/s  numa_pte %s/s", b1, b2, b3, b4, b5, b6);
+            int x = P_print(y, 0, CP_LABEL, "drivers: ");
+            P_print(y, x, 0, "THPcollapse %s/s  PMDsplit %s/s  migrate %s/s  "
+                    "reclaim %s/s  compactstall %s/s  numa_pte %s/s",
+                    b1, b2, b3, b4, b5, b6);
             y++;
         }
     }
@@ -506,18 +696,15 @@ void ui_draw(struct snapshot *s)
         section(y++, hdr);
     }
     if (!s->trace_ok) {
-        attron(COLOR_PAIR(CP_WARN));
-        if (y < H - 1) mvprintw(y++, 2, "%s", s->trace_err);
-        attroff(COLOR_PAIR(CP_WARN));
+        if (y < H - 1) P_print(y++, 2, CP_WARN, "%s", s->trace_err);
     } else if (y < H - 1) {
-        attron(COLOR_PAIR(CP_TABHDR));
-        move(y, 0);
-        printw("%7s %-16s %8s %9s %8s %8s %8s %8s  %-24s",
-               "PID", "COMM", st.cumulative ? "ΣSEND" : "SEND/s",
-               st.cumulative ? "ΣPAGES" : "PAGES/s",
-               "LOCAL", "LOCMM", "SWTCH", "RECV", "ORIGIN");
-        for (int i = getcurx(stdscr); i < W; i++) addch(' ');
-        attroff(COLOR_PAIR(CP_TABHDR));
+        char hb[G_MAXC + 1];
+        snprintf(hb, sizeof hb, "%7s %-16s %8s %9s %8s %8s %8s %8s  %-24s",
+                 "PID", "COMM", st.cumulative ? "SEND" : "SEND/s",
+                 st.cumulative ? "PAGES" : "PAGES/s",
+                 "LOCAL", "LOCMM", "SWTCH", "RECV", "ORIGIN");
+        for (int i = 0; i < W; i++)
+            P_putc(y, i, CP_TABHDR, i < (int)strlen(hb) ? hb[i] : ' ');
         y++;
 
         qsort(s->pids, s->npid, sizeof s->pids[0], row_cmp);
@@ -527,12 +714,6 @@ void ui_draw(struct snapshot *s)
 
         for (int i = st.scroll; i < s->npid && y < H - 1; i++, y++) {
             struct pid_stat *p = &s->pids[i];
-            uint64_t tot = 0;
-            for (int r = 0; r < REASON_MAX; r++)
-                tot += st.cumulative ? p->cum[r] : p->cnt[r];
-            if (tot == 0 && st.sort != SORT_CUMSEND && !st.cumulative) {
-                attron(A_DIM);
-            }
             char c1[16], c2[16], c3[16], c4[16], c5[16], c6[16];
             if (st.cumulative) {
                 fmt_count(p->cum[R_REMOTE_SEND], c1, sizeof c1);
@@ -557,36 +738,33 @@ void ui_draw(struct snapshot *s)
             char comm[COMM_LEN + 3];
             snprintf(comm, sizeof comm, p->kthread ? "[%s]" : "%s", p->comm);
             bool hot = (st.cumulative ? p->cum[R_REMOTE_SEND] : p->cnt[R_REMOTE_SEND]) > 0;
-            if (hot) attron(A_BOLD);
-            mvprintw(y, 0, "%7d %-16.16s %8s %9s %8s %8s %8s %8s  %-24.24s",
-                     p->pid, comm, c1, c2, c3, c4, c5, c6,
-                     best ? trace_symname(s->ts, best) : "-");
-            if (hot) attroff(A_BOLD);
-            attroff(A_DIM);
+            uint64_t tot = 0;
+            for (int r = 0; r < REASON_MAX; r++)
+                tot += st.cumulative ? p->cum[r] : p->cnt[r];
+            unsigned at = hot ? AT_BOLD : (tot == 0 ? AT_DIM : 0);
+            P_print(y, 0, at, "%7d %-16.16s %8s %9s %8s %8s %8s %8s  %-24.24s",
+                    p->pid, comm, c1, c2, c3, c4, c5, c6,
+                    best ? trace_symname(s->ts, best) : "-");
         }
     }
 
     /* ---- key bar ---- */
-    move(H - 1, 0);
-    static const struct { const char *k, *lab; } keys[] = {
-        { "F1", "Help" }, { "F5", "Sort" }, { "c", "Cumul" }, { "p", "Pause" },
-        { "m", "Grid" }, { "r", "Reset" }, { "q", "Quit" },
-    };
-    for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
-        attron(A_BOLD);
-        printw("%s", keys[i].k);
-        attroff(A_BOLD);
-        attron(COLOR_PAIR(CP_FKEY));
-        printw("%-6s", keys[i].lab);
-        attroff(COLOR_PAIR(CP_FKEY));
+    {
+        static const struct { const char *k, *lab; } keys[] = {
+            { "F1", "Help" }, { "F5", "Sort" }, { "c", "Cumul" }, { "p", "Pause" },
+            { "m", "Grid" }, { "r", "Reset" }, { "q", "Quit" },
+        };
+        int x = 0;
+        for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {
+            x = P_print(H - 1, x, AT_BOLD, "%s", keys[i].k);
+            x = P_print(H - 1, x, CP_FKEY, "%-6s", keys[i].lab);
+        }
+        char up[40];
+        snprintf(up, sizeof up, "%s up %d:%02d:%02d", ansi ? "[ansi]" : "",
+                 (int)s->uptime / 3600, ((int)s->uptime / 60) % 60, (int)s->uptime % 60);
+        P_print(H - 1, W - (int)strlen(up) - 1, AT_DIM, "%s", up);
     }
-    attron(A_DIM);
-    char up[32];
-    snprintf(up, sizeof up, " up %d:%02d:%02d", (int)s->uptime / 3600,
-             ((int)s->uptime / 60) % 60, (int)s->uptime % 60);
-    mvprintw(H - 1, W - (int)strlen(up) - 1, "%s", up);
-    attroff(A_DIM);
 
     if (st.help) draw_help();
-    refresh();
+    P_frame_end();
 }

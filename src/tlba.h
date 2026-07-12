@@ -143,6 +143,7 @@ int  trace_interval(struct trace_state *ts, struct pid_stat **pids_out,
                     uint64_t *pages_tot, uint64_t *lost, uint64_t *lost_cum);
 const char *trace_symname(struct trace_state *ts, uint32_t sym);
 const char *origin_hint(const char *sym);   /* plain-English origin, or NULL */
+const char *trace_mode(struct trace_state *ts);  /* capture mode description */
 /* per-sending-CPU IPI-send event counts for the last closed interval */
 const uint64_t *trace_cpu_sends(struct trace_state *ts);
 /* context-channel (task-switch/IPI-recv) drops; cosmetic, recv totals stay
@@ -150,6 +151,16 @@ const uint64_t *trace_cpu_sends(struct trace_state *ts);
 void trace_lost_ctx(struct trace_state *ts, uint64_t *cur, uint64_t *cum);
 void trace_reset_cum(struct trace_state *ts);
 void trace_close(struct trace_state *ts);
+
+/* ------------- /proc fallback suspects (no tracepoint needed) ------------- */
+
+struct suspect {
+    int    pid;
+    char   comm[COMM_LEN + 1];
+    double minflt, majflt;   /* per second */
+    long   rss_kb;
+};
+int suspects_scan(struct suspect *out, int max, double dt);
 
 /* ---------------- UI ---------------- */
 
@@ -169,6 +180,8 @@ struct snapshot {
     uint64_t reason_tot[REASON_MAX], reason_cum[REASON_MAX];
     uint64_t pages_tot, lost, lost_cum, lost_ctx, lost_ctx_cum;
     struct trace_state *ts;     /* for symbol lookup */
+    struct suspect susp[64];    /* /proc fallback when trace_ok is false */
+    int    nsusp;
     double uptime;
 };
 

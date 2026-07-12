@@ -138,6 +138,8 @@ struct trace_state {
     int ncpu;
     struct ring ring[CH__N][MAX_CPUS];
     bool split;                        /* filters worked; CH_CTX active */
+    bool kprobe;                       /* kprobe fallback: send events only */
+    char mode[96];
     struct kallsyms ks;
     int reason_off, pages_off;
 
@@ -265,21 +267,74 @@ static void close_channel(struct trace_state *ts, int ch)
     }
 }
 
+static bool kallsyms_has(const struct kallsyms *ks, const char *name)
+{
+    for (uint32_t i = 0; i < ks->n; i++)
+        if (!strcmp(ks->names + ks->sym[i].name_off, name)) return true;
+    return false;
+}
+
+/*
+ * Fallback when the tracepoint is unavailable (tracefs hidden, container):
+ * a dynamic perf kprobe on the kernel's remote-flush function.  Same per-PID
+ * + callchain attribution of IPI senders; no reasons/pages breakdown.
+ */
+static bool open_kprobe(struct trace_state *ts, struct perf_event_attr *a,
+                        char *errbuf, size_t errlen)
+{
+    int ktype = -1;
+    FILE *f = fopen("/sys/bus/event_source/devices/kprobe/type", "r");
+    if (f) {
+        if (fscanf(f, "%d", &ktype) != 1) ktype = -1;
+        fclose(f);
+    }
+    if (ktype < 0) {
+        snprintf(errbuf, errlen, "no tracepoint and no kprobe PMU either "
+                 "(container or locked-down kernel) - run ./selftest.sh");
+        return false;
+    }
+    static const char *cands[] = {
+        "native_flush_tlb_multi",     /* 5.8+  */
+        "native_flush_tlb_others",    /* older */
+        "flush_tlb_mm_range",         /* approximate: local+remote */
+    };
+    for (size_t i = 0; i < sizeof cands / sizeof cands[0]; i++) {
+        if (ts->ks.n && !kallsyms_has(&ts->ks, cands[i])) continue;
+        memset(a, 0, sizeof *a);
+        a->size = sizeof *a;
+        a->type = (uint32_t)ktype;
+        a->config = 0;                          /* kprobe, not kretprobe */
+        a->config1 = (uint64_t)(uintptr_t)cands[i];
+        a->sample_period = 1;
+        a->sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_CPU | PERF_SAMPLE_CALLCHAIN;
+        a->exclude_callchain_user = 1;
+        a->sample_max_stack = MAX_STACK;
+        a->exclude_guest = 1;
+        if (open_channel(ts, CH_ATTR, a, NULL) > 0) {
+            ts->kprobe = true;
+            snprintf(ts->mode, sizeof ts->mode,
+                     "kprobe:%s (tracefs unavailable; send events only)", cands[i]);
+            return true;
+        }
+        close_channel(ts, CH_ATTR);
+    }
+    snprintf(errbuf, errlen, "kprobe attach failed (%s) - run ./selftest.sh",
+             strerror(errno));
+    return false;
+}
+
 struct trace_state *trace_open(int ncpu, char *errbuf, size_t errlen)
 {
+    if (getenv("TLBA_NO_ATTRIB")) {   /* testing: exercise /proc suspects UI */
+        snprintf(errbuf, errlen, "disabled by TLBA_NO_ATTRIB");
+        return NULL;
+    }
     /* minimal images often boot without tracefs mounted; fix it ourselves */
     if (access("/sys/kernel/tracing/events", F_OK) != 0 &&
         access("/sys/kernel/debug/tracing/events", F_OK) != 0 &&
         geteuid() == 0)
         mount("tracefs", "/sys/kernel/tracing", "tracefs", 0, NULL);
 
-    int tp_id = tp_read_int("id", -1);
-    if (tp_id < 0) {
-        snprintf(errbuf, errlen, "tlb:tlb_flush tracepoint not found - "
-                 "tracefs missing or inaccessible (container?); try: "
-                 "mount -t tracefs tracefs /sys/kernel/tracing");
-        return NULL;
-    }
     struct trace_state *ts = calloc(1, sizeof *ts);
     if (!ts) return NULL;
     ts->ncpu = ncpu;
@@ -292,34 +347,43 @@ struct trace_state *trace_open(int ncpu, char *errbuf, size_t errlen)
         ts->ks.n = 0;
 
     struct perf_event_attr a;
-    memset(&a, 0, sizeof a);
-    a.size = sizeof a;
-    a.type = PERF_TYPE_TRACEPOINT;
-    a.config = (uint64_t)tp_id;
-    a.sample_period = 1;                       /* capture EVERY event */
-    a.sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_CPU |
-                    PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_RAW;
-    a.exclude_callchain_user = 1;              /* kernel stacks only */
-    a.sample_max_stack = MAX_STACK;
-    a.exclude_guest = 1;
+    /* TLBA_NO_TRACEPOINT=1 forces the kprobe fallback (testing/debug) */
+    int tp_id = getenv("TLBA_NO_TRACEPOINT") ? -1 : tp_read_int("id", -1);
+    int n_attr = 0;
 
-    /* attribution channel: local + remote-send flushes, with callchains */
-    int n_attr = open_channel(ts, CH_ATTR, &a, "reason != 0 && reason != 1");
-    if (n_attr > 0) {
-        /* context channel: task-switch + IPI-receive, tiny records */
-        a.sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_CPU | PERF_SAMPLE_RAW;
-        a.sample_max_stack = 0;
-        int n_ctx = open_channel(ts, CH_CTX, &a, "reason == 0 || reason == 1");
-        if (n_ctx <= 0) close_channel(ts, CH_CTX);
-        ts->split = n_ctx > 0;
-    } else if (n_attr < 0) {
-        /* kernel lacks tracepoint filters: capture everything on one channel */
-        close_channel(ts, CH_ATTR);
-        n_attr = open_channel(ts, CH_ATTR, &a, NULL);
+    if (tp_id >= 0) {
+        memset(&a, 0, sizeof a);
+        a.size = sizeof a;
+        a.type = PERF_TYPE_TRACEPOINT;
+        a.config = (uint64_t)tp_id;
+        a.sample_period = 1;                       /* capture EVERY event */
+        a.sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_CPU |
+                        PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_RAW;
+        a.exclude_callchain_user = 1;              /* kernel stacks only */
+        a.sample_max_stack = MAX_STACK;
+        a.exclude_guest = 1;
+
+        /* attribution channel: local + remote-send flushes, with callchains */
+        n_attr = open_channel(ts, CH_ATTR, &a, "reason != 0 && reason != 1");
+        if (n_attr > 0) {
+            /* context channel: task-switch + IPI-receive, tiny records */
+            a.sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_CPU | PERF_SAMPLE_RAW;
+            a.sample_max_stack = 0;
+            int n_ctx = open_channel(ts, CH_CTX, &a, "reason == 0 || reason == 1");
+            if (n_ctx <= 0) close_channel(ts, CH_CTX);
+            ts->split = n_ctx > 0;
+        } else if (n_attr < 0) {
+            /* kernel lacks tracepoint filters: capture all on one channel */
+            close_channel(ts, CH_ATTR);
+            n_attr = open_channel(ts, CH_ATTR, &a, NULL);
+        }
+        if (n_attr > 0)
+            snprintf(ts->mode, sizeof ts->mode, "tlb:tlb_flush tracepoint (exact)");
+        else
+            snprintf(errbuf, errlen, "cannot attach to tlb:tlb_flush (%s) - "
+                     "run as root / CAP_PERFMON+CAP_SYS_ADMIN", strerror(errno));
     }
-    if (n_attr <= 0) {
-        snprintf(errbuf, errlen, "cannot attach to tlb:tlb_flush (%s) - "
-                 "run as root / CAP_PERFMON+CAP_SYS_ADMIN", strerror(errno));
+    if (n_attr <= 0 && !open_kprobe(ts, &a, errbuf, errlen)) {
         trace_close(ts);
         return NULL;
     }
@@ -327,6 +391,8 @@ struct trace_state *trace_open(int ncpu, char *errbuf, size_t errlen)
     ts->thread_running = pthread_create(&ts->drainer, NULL, drain_thread, ts) == 0;
     return ts;
 }
+
+const char *trace_mode(struct trace_state *ts) { return ts->mode; }
 
 /* ---------------- pid table ---------------- */
 
@@ -382,7 +448,7 @@ static void global_add_origin(struct trace_state *ts, uint32_t sym)
 static void handle_sample(struct trace_state *ts, const uint8_t *d, size_t len,
                           bool has_callchain)
 {
-    /* layout for our sample_type: TID, CPU, [CALLCHAIN,] RAW */
+    /* layout for our sample_type: TID, CPU, [CALLCHAIN,] [RAW] */
     size_t off = 0;
     if (off + 16 > len) return;
     uint32_t pid = *(const uint32_t *)(d + off);
@@ -399,21 +465,28 @@ static void handle_sample(struct trace_state *ts, const uint8_t *d, size_t len,
         if (nr > MAX_STACK + 4) nr = 0;
         off += nr * 8;
     }
-    if (off + 4 > len) return;
-    uint32_t raw_size = *(const uint32_t *)(d + off);
-    off += 4;
-    if (off + raw_size > len) return;
-    const uint8_t *raw = d + off;
 
-    int reason = 0;
+    int reason;
     uint64_t pages = 0;
-    if ((size_t)ts->reason_off + 4 <= raw_size)
-        reason = *(const int32_t *)(raw + ts->reason_off);
-    if ((size_t)ts->pages_off + 8 <= raw_size)
-        pages = *(const uint64_t *)(raw + ts->pages_off);
-    /* TLB_FLUSH_ALL (-1UL) marks a full flush, not a page count */
-    if (pages >= (1ULL << 32)) pages = 0;
-    if (reason < 0 || reason >= REASON_MAX) return;
+    if (ts->kprobe) {
+        /* probe sits on the remote-flush function: every hit is a send */
+        reason = R_REMOTE_SEND;
+    } else {
+        if (off + 4 > len) return;
+        uint32_t raw_size = *(const uint32_t *)(d + off);
+        off += 4;
+        if (off + raw_size > len) return;
+        const uint8_t *raw = d + off;
+
+        reason = 0;
+        if ((size_t)ts->reason_off + 4 <= raw_size)
+            reason = *(const int32_t *)(raw + ts->reason_off);
+        if ((size_t)ts->pages_off + 8 <= raw_size)
+            pages = *(const uint64_t *)(raw + ts->pages_off);
+        /* TLB_FLUSH_ALL (-1UL) marks a full flush, not a page count */
+        if (pages >= (1ULL << 32)) pages = 0;
+        if (reason < 0 || reason >= REASON_MAX) return;
+    }
 
     ts->reason_cnt[reason]++;
     ts->reason_cum[reason]++;

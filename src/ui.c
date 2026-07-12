@@ -508,6 +508,20 @@ void ui_draw(struct snapshot *s)
             st.paused ? "  [PAUSED]" : "");
     y = 1;
 
+    /* ---- setup problems, front and centre ---- */
+    if (!s->trace_ok || !s->pmu_ok) {
+        section(y++, "SETUP NEEDED");
+        if (!s->trace_ok) {
+            P_print(y++, 1, CP_WARN | AT_BOLD, "! flush attribution offline: %s",
+                    s->trace_err);
+            P_print(y++, 3, AT_DIM, "run 'sudo ./selftest.sh' to diagnose; "
+                    "showing /proc page-fault churn suspects below instead");
+        }
+        if (!s->pmu_ok)
+            P_print(y++, 1, CP_WARN | AT_BOLD, "! PMU counters offline: %s",
+                    s->pmu_err);
+    }
+
     /* ---- CPU meters ---- */
     int n = t->ncpu;
     int cols = W / 34;              /* meters may use the full width */
@@ -532,16 +546,9 @@ void ui_draw(struct snapshot *s)
         y++;
     }
 
-    /* ---- CACHE section ---- */
-    if (y < H - 3) {
-        char hdr[128];
-        snprintf(hdr, sizeof hdr, "CACHE / TLB MISSES  (per-CPU PMU%s)",
-                 s->pmu_ok ? "" : " - UNAVAILABLE");
-        section(y++, hdr);
-    }
-    if (!s->pmu_ok) {
-        P_print(y++, 2, CP_WARN, "%s", s->pmu_err);
-    } else {
+    /* ---- CACHE section (only when the PMU delivers) ---- */
+    if (s->pmu_ok) {
+        if (y < H - 3) section(y++, "CACHE / TLB MISSES  (per-CPU PMU)");
         static double strip[MAX_CPUS];
         double instr_tot = 0, cyc_tot = 0, scaled = 0;
         for (int i = 0; i < n; i++) {
@@ -663,6 +670,7 @@ void ui_draw(struct snapshot *s)
                 x = P_print(y, x, r == R_REMOTE_SEND ? AT_BOLD : 0,
                             "%s %s/s  ", tlb_reason_short[r], b1);
             }
+            P_print(y, x, AT_DIM, "  [%s]", trace_mode(s->ts));
             y++;
         }
         if (s->trace_ok && y < H - 3 && s->norigin > 0) {
@@ -734,15 +742,37 @@ void ui_draw(struct snapshot *s)
     }
 
     /* ---- attribution table ---- */
-    if (y < H - 2) {
+    if (!s->trace_ok) {
+        /* /proc fallback: page-fault churn points at mmap-heavy processes */
+        if (y < H - 2)
+            section(y++, "SUSPECTS  (heuristic: page-fault/mmap churn - "
+                         "flush events not available)");
+        if (y < H - 1) {
+            char hb[G_MAXC + 1];
+            snprintf(hb, sizeof hb, "%7s %-16s %11s %11s %10s",
+                     "PID", "COMM", "MINFLT/s", "MAJFLT/s", "RSS-MB");
+            for (int i = 0; i < W; i++)
+                P_putc(y, i, CP_TABHDR, i < (int)strlen(hb) ? hb[i] : ' ');
+            y++;
+            for (int i = 0; i < s->nsusp && y < H - 1; i++, y++) {
+                struct suspect *sp = &s->susp[i];
+                char c1[16], c2[16];
+                fmt_rate(sp->minflt, c1, sizeof c1);
+                fmt_rate(sp->majflt, c2, sizeof c2);
+                P_print(y, 0, i == 0 ? AT_BOLD : 0,
+                        "%7d %-16.16s %11s %11s %10ld",
+                        sp->pid, sp->comm, c1, c2, sp->rss_kb / 1024);
+            }
+            if (s->nsusp == 0 && y < H - 1)
+                P_print(y++, 2, AT_DIM, "(no page-fault activity this interval)");
+        }
+    } else if (y < H - 2) {
         char hdr[96];
         snprintf(hdr, sizeof hdr, "WHO IS FLUSHING  (sort: %s%s)",
                  sort_name[st.sort], st.cumulative ? ", cumulative" : "");
         section(y++, hdr);
     }
-    if (!s->trace_ok) {
-        if (y < H - 1) P_print(y++, 2, CP_WARN, "%s", s->trace_err);
-    } else if (y < H - 1) {
+    if (s->trace_ok && y < H - 1) {
         char hb[G_MAXC + 1];
         snprintf(hb, sizeof hb, "%7s %-16s %8s %9s %8s %8s %8s %8s  %-24s",
                  "PID", "COMM", st.cumulative ? "SEND" : "SEND/s",

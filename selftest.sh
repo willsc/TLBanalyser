@@ -28,9 +28,11 @@ else
 fi
 if [ -f /sys/kernel/tracing/events/tlb/tlb_flush/id ]; then
     ok "tlb:tlb_flush tracepoint present (id $(cat /sys/kernel/tracing/events/tlb/tlb_flush/id))"
-else
-    bad "tlb:tlb_flush tracepoint missing - attribution impossible on this kernel"
+elif [ -d /sys/bus/event_source/devices/kprobe ]; then
+    warn "tlb:tlb_flush tracepoint missing - kprobe fallback will be used (send attribution only)"
     info "available event groups: $(ls /sys/kernel/tracing/events 2>/dev/null | tr '\n' ' ' | cut -c1-120)"
+else
+    bad "no tracepoint AND no kprobe PMU - only /proc heuristics available"
 fi
 grep -q '^ *TLB:' /proc/interrupts && ok "TLB shootdown row in /proc/interrupts" \
                                     || bad "no TLB row in /proc/interrupts"

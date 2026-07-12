@@ -136,6 +136,7 @@ static void batch_print(struct snapshot *s, int top)
         printf("reasons/s:");
         for (int r = 0; r < 6; r++)
             printf(" %s=%.0f", tlb_reason_short[r], (double)s->reason_tot[r] / s->dt);
+        printf("  [%s]", trace_mode(s->ts));
         printf("\norigins:");
         for (int i = 0; i < s->norigin && i < 6; i++) {
             if (!s->origins[i].cnt) break;
@@ -183,6 +184,13 @@ static void batch_print(struct snapshot *s, int top)
                    best ? trace_symname(s->ts, best) : "-");
             shown++;
         }
+    } else {
+        printf("suspects (heuristic, no flush events): %7s %-16s %10s %10s %8s\n",
+               "PID", "COMM", "MINFLT/s", "MAJFLT/s", "RSS-MB");
+        for (int i = 0; i < s->nsusp && i < top; i++)
+            printf("%39d %-16.16s %10.0f %10.0f %8ld\n",
+                   s->susp[i].pid, s->susp[i].comm, s->susp[i].minflt,
+                   s->susp[i].majflt, s->susp[i].rss_kb / 1024);
     }
     fflush(stdout);
 }
@@ -250,6 +258,10 @@ int main(int argc, char **argv)
             snap.uptime = t - t_start;
             proc_rates_calc(&snap.proc, &ps[cur ^ 1], &ps[cur], topo.ncpu, dt);
             if (pmu) pmu_read(pmu, snap.pmu, dt);
+            if (!ts)
+                snap.nsusp = suspects_scan(snap.susp,
+                                           (int)(sizeof snap.susp / sizeof snap.susp[0]),
+                                           dt);
             if (ts) {
                 snap.npid = trace_interval(ts, &snap.pids, &snap.origins,
                                            &snap.norigin, snap.reason_tot,

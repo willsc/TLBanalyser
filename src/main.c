@@ -4,6 +4,8 @@
 #include <signal.h>
 #include <time.h>
 #include <limits.h>
+#include <fcntl.h>
+#include <sys/wait.h>
 #include <ncurses.h>
 #include <term.h>
 
@@ -36,19 +38,39 @@ static void usage(const char *argv0)
 }
 
 /*
- * Minimal server images sometimes lack a terminfo database (or ship an
- * ncurses whose compiled-in path is empty).  Probe with setupterm() - which
- * reports failure instead of exiting - and fall back to the terminfo entries
- * bundled next to the binary, then to progressively simpler $TERM values.
- * Returns false only if no usable terminal description exists at all.
+ * Probe whether this host's curses can load a terminal description.
+ * Some curses substitutes (seen on cloud images) ignore setupterm()'s
+ * error-return contract and exit() the whole process with a message, so
+ * the probe runs in a forked child: whatever the library does there -
+ * return, exit, print, abort - cannot take us down.  Must be called
+ * before any threads are started.
+ */
+static bool probe_setupterm(void)
+{
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid < 0) return false;
+    if (pid == 0) {
+        int nul = open("/dev/null", O_WRONLY);
+        if (nul >= 0) dup2(nul, STDERR_FILENO);   /* silence library rants */
+        int err = 0;
+        if (setupterm(NULL, STDOUT_FILENO, &err) == OK) _exit(0);
+        _exit(1);
+    }
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return false;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+/*
+ * Decide whether the curses backend is usable, adjusting the environment
+ * to help it: first as-is, then with the terminfo entries bundled next to
+ * the binary, then with progressively simpler $TERM values.  Returns false
+ * if curses cannot work at all (caller switches to the ANSI renderer).
  */
 static bool terminfo_setup(void)
 {
-    int err;
-    if (setupterm(NULL, STDOUT_FILENO, &err) == OK) {
-        del_curterm(cur_term);
-        return true;
-    }
+    if (probe_setupterm()) return true;
 
     char exe[PATH_MAX], dirs[PATH_MAX * 2];
     ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
@@ -62,24 +84,20 @@ static bool terminfo_setup(void)
         snprintf(tinfo, sizeof tinfo, "%s/terminfo", exe);
         setenv("TERMINFO", tinfo, 1);
         setenv("TERMINFO_DIRS", dirs, 1);
-        if (setupterm(NULL, STDOUT_FILENO, &err) == OK) {
-            del_curterm(cur_term);
-            return true;
-        }
+        if (probe_setupterm()) return true;
     }
 
     static const char *fallback[] = { "xterm-256color", "xterm", "vt100" };
     for (size_t i = 0; i < sizeof fallback / sizeof fallback[0]; i++) {
         setenv("TERM", fallback[i], 1);
-        if (setupterm(NULL, STDOUT_FILENO, &err) == OK) {
-            del_curterm(cur_term);
+        if (probe_setupterm()) {
             fprintf(stderr, "tlbanalyser: no terminfo for your terminal, "
                     "falling back to TERM=%s\n", fallback[i]);
             return true;
         }
     }
     fprintf(stderr, "tlbanalyser: curses cannot load any terminal description "
-            "on this host (broken/nonstandard terminfo)\n");
+            "on this host (broken/nonstandard curses library)\n");
     return false;
 }
 

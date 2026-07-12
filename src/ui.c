@@ -30,7 +30,7 @@ static struct {
     int  scroll;
     bool paused;
     bool help;
-    bool compact_cpu;   /* force compact CPU grid */
+    int  cpu_view;      /* 0 auto, 1 force meters, 2 force compact strip */
     bool cumulative;    /* show cumulative counts in table */
 } st;
 
@@ -305,7 +305,7 @@ int ui_key(int ch)
     case 'r': case 'R': return 2;
     case 'p': case ' ': st.paused = !st.paused; break;
     case 'h': case '?': case KEY_F(1): st.help = !st.help; break;
-    case 'm': st.compact_cpu = !st.compact_cpu; break;
+    case 'm': st.cpu_view = (st.cpu_view + 1) % 3; break;
     case 'c': st.cumulative = !st.cumulative; break;
     case 's': case KEY_F(5): st.sort = (st.sort + 1) % SORT__N; break;
     case KEY_UP:    if (st.scroll > 0) st.scroll--; break;
@@ -375,6 +375,7 @@ static void draw_heat(int y, int x, int w, const double *val, int n, double lo, 
     P_putc(y, x, AT_BOLD, '[');
     int cells = w - 2;
     if (cells < 1) return;
+    if (cells > n) cells = n;                 /* one cell per CPU, no dead space */
     int per = (n + cells - 1) / cells;        /* CPUs per cell */
     if (per < 1) per = 1;
     int used = (n + per - 1) / per;
@@ -454,7 +455,7 @@ static void draw_help(void)
         "          shrink_folio_list=memory reclaim  migrate_pages*=migration",
         "          collapse_huge_page/khugepaged=THP  zap_page_range=exit/free",
         "",
-        "KEYS  s/F5 sort   c cumulative   p pause   m compact CPU grid",
+        "KEYS  s/F5 sort   c cumulative   p pause   m CPU view (auto/bars/strip)",
         "      r reset cumulative   arrows/PgUp/PgDn scroll   q quit",
         "",
         "                      press h to close",
@@ -488,6 +489,8 @@ void ui_draw(struct snapshot *s)
 {
     P_frame_begin();
     int W = P_cols(), H = P_rows(), y = 0;
+    /* cap panel width on very wide terminals so values stay near their strips */
+    int Wc = W > 170 ? 170 : W;
     char b1[32], b2[32], b3[32], b4[32];
     const struct topology *t = s->topo;
 
@@ -507,12 +510,12 @@ void ui_draw(struct snapshot *s)
 
     /* ---- CPU meters ---- */
     int n = t->ncpu;
-    bool compact = st.compact_cpu || n > 64;
+    int cols = W / 34;              /* meters may use the full width */
+    if (cols < 1) cols = 1;
+    if (cols > 8) cols = 8;
+    int rows = (n + cols - 1) / cols;
+    bool compact = st.cpu_view == 2 || (st.cpu_view == 0 && rows > 16);
     if (!compact) {
-        int cols = W / 34;
-        if (cols < 1) cols = 1;
-        if (cols > 4) cols = 4;
-        int rows = (n + cols - 1) / cols;
         int mw = W / cols;
         for (int i = 0; i < n; i++)
             draw_cpu_meter(y + i % rows, (i / rows) * mw, mw - 1, i, &s->proc.load[i]);
@@ -524,8 +527,8 @@ void ui_draw(struct snapshot *s)
         double avg = 0;
         for (int i = 0; i < n; i++) avg += busy[i];
         avg /= n > 0 ? n : 1;
-        draw_heat(y, 10, W - 20, busy, n, 0, 1);
-        P_print(y, W - 8, 0, "%5.1f%%", avg * 100);
+        draw_heat(y, 10, Wc - 20, busy, n, 0, 1);
+        P_print(y, Wc - 8, 0, "%5.1f%%", avg * 100);
         y++;
     }
 
@@ -547,42 +550,47 @@ void ui_draw(struct snapshot *s)
             scaled += s->pmu[i].scaled ? 1 : 0;
         }
         if (instr_tot <= 0) instr_tot = 1;
-        struct {
+        static const struct {
             const char *lab;
             enum pmu_ev num, den;   /* den = EV__N -> per-1000-instr (MPKI) */
             double hi;              /* strip scale max */
-        } rows[] = {
+        } cache_rows[] = {
             { "L1d miss%", EV_L1D_MISS, EV_L1D_ACC, 0.25 },
             { "L2  miss%", EV_L2_MISS,  EV_L2_ACC,  0.60 },
             { "dTLB MPKI", EV_DTLB_MISS, EV__N,     5.0  },
             { "iTLB MPKI", EV_ITLB_MISS, EV__N,     2.0  },
         };
-        for (size_t r = 0; r < sizeof rows / sizeof rows[0] && y < H - 3; r++) {
+        for (size_t r = 0; r < sizeof cache_rows / sizeof cache_rows[0] && y < H - 3; r++) {
             double sum_n = 0, sum_d = 0;
             bool avail = true;
             for (int i = 0; i < n; i++) {
-                double num = s->pmu[i].v[rows[r].num];
-                if (!s->pmu[i].ok[rows[r].num]) { avail = false; continue; }
+                double num = s->pmu[i].v[cache_rows[r].num];
+                if (!s->pmu[i].ok[cache_rows[r].num]) { avail = false; continue; }
                 sum_n += num;
-                if (rows[r].den == EV__N) {
+                if (cache_rows[r].den == EV__N) {
                     double in = s->pmu[i].v[EV_INSTR];
                     strip[i] = in > 0 ? num / (in / 1000.0) : 0;
                     sum_d += s->pmu[i].v[EV_INSTR];
                 } else {
-                    double den = s->pmu[i].v[rows[r].den];
+                    double den = s->pmu[i].v[cache_rows[r].den];
                     strip[i] = den > 0 ? num / den : 0;
                     sum_d += den;
                 }
             }
-            P_print(y, 0, CP_LABEL, "%-9s", rows[r].lab);
+            P_print(y, 0, CP_LABEL, "%-9s", cache_rows[r].lab);
             if (!avail && sum_n == 0) {
-                P_print(y++, 10, AT_DIM, "event unavailable on this PMU");
+                /* keep the bracket column so unavailable rows stay aligned */
+                P_putc(y, 10, AT_BOLD, '[');
+                P_putc(y, 10 + (Wc - 34) - 1, AT_BOLD, ']');
+                P_print(y, 12, AT_DIM,
+                        "event not exposed on this PMU (virtualized instance?)");
+                y++;
                 continue;
             }
-            draw_heat(y, 10, W - 34, strip, n, 0, rows[r].hi);
+            draw_heat(y, 10, Wc - 34, strip, n, 0, cache_rows[r].hi);
             double agg;
             char txt[64];
-            if (rows[r].den == EV__N) {
+            if (cache_rows[r].den == EV__N) {
                 agg = sum_d > 0 ? sum_n / (sum_d / 1000.0) : 0;
                 fmt_rate(sum_n, b1, sizeof b1);
                 snprintf(txt, sizeof txt, "%6.2f avg  %s/s", agg, b1);
@@ -591,12 +599,12 @@ void ui_draw(struct snapshot *s)
                 fmt_rate(sum_n, b1, sizeof b1);
                 snprintf(txt, sizeof txt, "%5.1f%% avg  %s/s", agg, b1);
             }
-            P_print(y, W - 23, 0, "%22s", txt);
+            P_print(y, Wc - 23, 0, "%22s", txt);
             y++;
         }
-        P_print(y++, 0, AT_DIM, "L2 event: %s%s   IPC %.2f", s->l2_desc,
-                scaled > 0 ? "  [multiplexed]" : "",
-                cyc_tot > 0 ? instr_tot / cyc_tot : 0);
+        P_print(y++, 0, AT_DIM, "IPC %.2f   L2 events: %s%s",
+                cyc_tot > 0 ? instr_tot / cyc_tot : 0, s->l2_desc,
+                scaled > 0 ? "   (some counters multiplexed)" : "");
     }
 
     /* ---- TLB / IPI section ---- */
@@ -609,9 +617,9 @@ void ui_draw(struct snapshot *s)
             if (strip[i] > mx) mx = strip[i];
         }
         P_print(y, 0, CP_LABEL, "recv/CPU ");
-        draw_heat(y, 10, W - 34, strip, n, 0, mx);
+        draw_heat(y, 10, Wc - 34, strip, n, 0, mx);
         fmt_rate(s->proc.tlb_recv_tot, b1, sizeof b1);
-        P_print(y, W - 23, 0, "%14s/s total", b1);
+        P_print(y, Wc - 23, 0, "%14s/s total", b1);
         y++;
 
         if (s->trace_ok && y < H - 3) {
@@ -623,9 +631,9 @@ void ui_draw(struct snapshot *s)
                 if (strip[i] > sm) sm = strip[i];
             }
             P_print(y, 0, CP_LABEL, "send/CPU ");
-            draw_heat(y, 10, W - 34, strip, n, 0, sm);
+            draw_heat(y, 10, Wc - 34, strip, n, 0, sm);
             fmt_rate(tot, b1, sizeof b1);
-            P_print(y, W - 23, 0, "%14s/s total", b1);
+            P_print(y, Wc - 23, 0, "%14s/s total", b1);
             y++;
         }
         if (y < H - 3) {

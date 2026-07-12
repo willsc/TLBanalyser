@@ -91,8 +91,8 @@ it) — same layout, same colors, no terminfo needed at all. Batch mode
 (`-b`) never needs a terminal.
 
 Keys: `F1` help · `F5`/`s` sort (SEND, TOTAL, RECV, ΣSEND) · `c` cumulative ·
-`p` pause · `m` compact CPU grid · `r` reset cumulative · arrows/PgUp/PgDn
-scroll · `q` quit.
+`p` pause · `m` CPU view (auto / per-CPU bars / compact strip) · `r` reset
+cumulative · arrows/PgUp/PgDn scroll · `q` quit.
 
 Options: `-d SEC` refresh interval (default 1.5) · `-b` batch · `-n N` batch
 iterations · `-t N` batch top-N processes.

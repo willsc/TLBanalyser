@@ -17,7 +17,13 @@ tlbanalyser: $(OBJ)
 install: tlbanalyser
 	install -D -m 0755 tlbanalyser $(DESTDIR)$(PREFIX)/bin/tlbanalyser
 
-clean:
-	rm -f tlbanalyser $(OBJ)
+test/shootgen: test/shootgen.c
+	$(CC) $(CFLAGS) -o $@ $< -lpthread
 
-.PHONY: all install clean
+test: tlbanalyser test/shootgen
+	./selftest.sh
+
+clean:
+	rm -f tlbanalyser test/shootgen $(OBJ)
+
+.PHONY: all install clean test

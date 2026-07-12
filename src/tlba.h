@@ -142,6 +142,7 @@ int  trace_interval(struct trace_state *ts, struct pid_stat **pids_out,
                     uint64_t reason_cum[REASON_MAX],
                     uint64_t *pages_tot, uint64_t *lost, uint64_t *lost_cum);
 const char *trace_symname(struct trace_state *ts, uint32_t sym);
+const char *origin_hint(const char *sym);   /* plain-English origin, or NULL */
 /* per-sending-CPU IPI-send event counts for the last closed interval */
 const uint64_t *trace_cpu_sends(struct trace_state *ts);
 /* context-channel (task-switch/IPI-recv) drops; cosmetic, recv totals stay

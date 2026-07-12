@@ -657,6 +657,40 @@ const char *trace_symname(struct trace_state *ts, uint32_t sym)
     return ts->ks.names + ts->ks.sym[sym - 1].name_off;
 }
 
+/* plain-English meaning of a kernel flush-origin function, or NULL */
+const char *origin_hint(const char *sym)
+{
+    static const struct { const char *pfx, *hint; } map[] = {
+        { "wp_page_copy",       "CoW write fault" },
+        { "do_madvise",         "allocator MADV_DONTNEED/FREE" },
+        { "madvise",            "allocator MADV_DONTNEED/FREE" },
+        { "zap_p",              "munmap/free" },
+        { "unmap_region",       "munmap" },
+        { "vms_clear_ptes",     "munmap" },
+        { "exit_mmap",          "process exit" },
+        { "shrink_",            "memory reclaim" },
+        { "try_to_unmap",       "memory reclaim" },
+        { "folio_referenced",   "memory reclaim scan" },
+        { "migrate_",           "page migration" },
+        { "move_ptes",          "mremap" },
+        { "collapse_huge_page", "THP collapse" },
+        { "khugepaged",         "THP collapse" },
+        { "split_huge",         "THP split" },
+        { "change_protection",  "mprotect (JIT/GC?)" },
+        { "do_mprotect_pkey",   "mprotect (JIT/GC?)" },
+        { "mprotect_fixup",     "mprotect (JIT/GC?)" },
+        { "page_vma_mkclean",   "writeback protect" },
+        { "dup_mmap",           "fork" },
+        { "relocate_vma_down",  "exec" },
+        { "ksm_",               "KSM merge" },
+        { "uprobe_",            "uprobe patching" },
+        { "switch_mm",          "context switch" },
+    };
+    for (size_t i = 0; i < sizeof map / sizeof map[0]; i++)
+        if (!strncmp(sym, map[i].pfx, strlen(map[i].pfx))) return map[i].hint;
+    return NULL;
+}
+
 void trace_reset_cum(struct trace_state *ts)
 {
     pthread_mutex_lock(&ts->lock);

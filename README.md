@@ -97,6 +97,26 @@ cumulative · arrows/PgUp/PgDn scroll · `q` quit.
 Options: `-d SEC` refresh interval (default 1.5) · `-b` batch · `-n N` batch
 iterations · `-t N` batch top-N processes.
 
+## Proving it works on your host
+
+```sh
+sudo make test        # or: sudo ./selftest.sh
+```
+
+The self-test diagnoses the environment (tracefs, tracepoint, container/
+virtualization restrictions, PMU availability), then launches a known
+workload (`test/shootgen`: cross-CPU madvise churn) and asserts that the
+tool catches it: shootdown IPIs must surge in the exact `/proc/interrupts`
+counters, shootgen's PID must appear as the top sender with a resolved
+kernel origin, and zero trace events may be lost. Exit code 0 = proven.
+
+The `assess:` line (TUI and batch) states the current conclusion in plain
+English, e.g.:
+
+```
+assess: shootgen (pid 374634) causes 99% of IPI sends via wp_page_copy = CoW write fault
+```
+
 ## Hunting residual shootdowns (NUMA balancing already off)
 
 1. Run `sudo ./tlbanalyser`, sort by **SEND/s** (default). The top rows are

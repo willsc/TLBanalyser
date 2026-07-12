@@ -142,7 +142,28 @@ static void batch_print(struct snapshot *s, int top)
             printf(" %s=%lu", trace_symname(s->ts, s->origins[i].sym),
                    (unsigned long)s->origins[i].cnt);
         }
-        printf("\n%7s %-16s %8s %9s %7s %7s %7s %7s  %s\n",
+        printf("\n");
+        if (s->reason_tot[R_REMOTE_SEND] > 0) {
+            struct pid_stat *tp = NULL;
+            for (int i = 0; i < s->npid; i++)
+                if (!tp || s->pids[i].cnt[R_REMOTE_SEND] > tp->cnt[R_REMOTE_SEND])
+                    tp = &s->pids[i];
+            if (tp && tp->cnt[R_REMOTE_SEND] > 0) {
+                uint32_t bs = 0;
+                uint64_t bc = 0;
+                for (int k = 0; k < 4; k++)
+                    if (tp->origin_cnt[k] > bc) { bc = tp->origin_cnt[k]; bs = tp->origin_sym[k]; }
+                const char *sym = bs ? trace_symname(s->ts, bs) : NULL;
+                const char *hint = sym ? origin_hint(sym) : NULL;
+                printf("assess: %s (pid %d) causes %.0f%% of IPI sends%s%s%s%s\n",
+                       tp->comm[0] ? tp->comm : "?", tp->pid,
+                       100.0 * (double)tp->cnt[R_REMOTE_SEND] /
+                           (double)s->reason_tot[R_REMOTE_SEND],
+                       sym ? " via " : "", sym ? sym : "",
+                       hint ? " = " : "", hint ? hint : "");
+            }
+        }
+        printf("%7s %-16s %8s %9s %7s %7s %7s %7s  %s\n",
                "PID", "COMM", "SEND/s", "PAGES/s", "LOCAL", "LOCMM", "SWTCH", "RECV", "ORIGIN");
         int shown = 0;
         for (int i = 0; i < s->npid && shown < top; i++) {

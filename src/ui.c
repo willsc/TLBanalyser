@@ -694,6 +694,43 @@ void ui_draw(struct snapshot *s)
                     b1, b2, b3, b4, b5, b6);
             y++;
         }
+        /* one-line verdict: what is causing the shootdowns right now */
+        if (y < H - 2) {
+            int x = P_print(y, 0, CP_LABEL | AT_BOLD, "assess:  ");
+            if (!s->trace_ok) {
+                P_print(y, x, AT_DIM, "attribution offline (tracepoint unavailable); "
+                        "IPI receive counts above remain exact");
+            } else {
+                double sends = (double)s->reason_tot[R_REMOTE_SEND];
+                if (sends < 1) {
+                    P_print(y, x, AT_DIM,
+                            "no remote shootdown senders this interval "
+                            "(recv %.0f/s from earlier/foreign flushes)",
+                            s->proc.tlb_recv_tot);
+                } else {
+                    struct pid_stat *top = NULL;
+                    for (int i = 0; i < s->npid; i++)
+                        if (!top || s->pids[i].cnt[R_REMOTE_SEND] > top->cnt[R_REMOTE_SEND])
+                            top = &s->pids[i];
+                    if (top && top->cnt[R_REMOTE_SEND] > 0) {
+                        uint32_t bs = 0;
+                        uint64_t bc = 0;
+                        for (int k = 0; k < 4; k++)
+                            if (top->origin_cnt[k] > bc) { bc = top->origin_cnt[k]; bs = top->origin_sym[k]; }
+                        const char *sym = bs ? trace_symname(s->ts, bs) : NULL;
+                        const char *hint = sym ? origin_hint(sym) : NULL;
+                        x = P_print(y, x, AT_BOLD, "%s (pid %d) causes %.0f%% of IPI sends",
+                                    top->comm[0] ? top->comm : "?", top->pid,
+                                    100.0 * (double)top->cnt[R_REMOTE_SEND] / sends);
+                        if (sym)
+                            P_print(y, x, 0, "  via %s%s%s%s", sym,
+                                    hint ? " = " : "", hint ? hint : "",
+                                    top->kthread ? "  [kernel thread]" : "");
+                    }
+                }
+            }
+            y++;
+        }
     }
 
     /* ---- attribution table ---- */

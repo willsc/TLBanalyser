@@ -501,6 +501,10 @@ void ui_draw(struct snapshot *s)
     int W = P_cols(), H = P_rows(), y = 0;
     /* cap panel width on very wide terminals so values stay near their strips */
     int Wc = W > 170 ? 170 : W;
+    /* shared geometry for all per-CPU strips: label(10) strip(SW) text(right) */
+    int SW = Wc - 56;
+    if (SW < 14) SW = Wc > 42 ? Wc - 28 : 14;
+    int TX = 10 + SW + 2;
     char b1[32], b2[32], b3[32], b4[32];
     const struct topology *t = s->topo;
 
@@ -547,12 +551,17 @@ void ui_draw(struct snapshot *s)
     } else {
         static double busy[MAX_CPUS];
         for (int i = 0; i < n; i++) busy[i] = s->proc.load[i].busy;
+        int cells = SW - 2 < n ? SW - 2 : n;
+        int per = cells > 0 ? (n + cells - 1) / cells : 1;
+        P_print(y++, 0, AT_DIM, "strips below: CPU0 at left, CPU%d at right, "
+                "%d CPU%s per cell;  ' '=zero  '.'=low  '@'=high", n - 1, per,
+                per > 1 ? "s" : "");
         P_print(y, 0, CP_LABEL, "CPU busy ");
         double avg = 0;
         for (int i = 0; i < n; i++) avg += busy[i];
         avg /= n > 0 ? n : 1;
-        draw_heat(y, 10, Wc - 20, busy, n, 0, 1);
-        P_print(y, Wc - 8, 0, "%5.1f%%", avg * 100);
+        draw_heat(y, 10, SW, busy, n, 0, 1);
+        P_print(y, TX, 0, "avg %.1f%% busy across %d CPUs", avg * 100, n);
         y++;
     }
 
@@ -568,14 +577,14 @@ void ui_draw(struct snapshot *s)
         }
         if (instr_tot <= 0) instr_tot = 1;
         static const struct {
-            const char *lab;
-            enum pmu_ev num, den;   /* den = EV__N -> per-1000-instr (MPKI) */
+            const char *lab, *what;
+            enum pmu_ev num, den;   /* den = EV__N -> per-1000-instr rate */
             double hi;              /* strip scale max */
         } cache_rows[] = {
-            { "L1d miss%", EV_L1D_MISS, EV_L1D_ACC, 0.25 },
-            { "L2  miss%", EV_L2_MISS,  EV_L2_ACC,  0.60 },
-            { "dTLB MPKI", EV_DTLB_MISS, EV__N,     5.0  },
-            { "iTLB MPKI", EV_ITLB_MISS, EV__N,     2.0  },
+            { "L1d miss ", "of loads miss L1d",   EV_L1D_MISS, EV_L1D_ACC, 0.25 },
+            { "L2  miss ", "of L2 lookups miss",  EV_L2_MISS,  EV_L2_ACC,  0.60 },
+            { "dTLB walk", "data-TLB",            EV_DTLB_MISS, EV__N,     5.0  },
+            { "iTLB walk", "instruction-TLB",     EV_ITLB_MISS, EV__N,     2.0  },
         };
         for (size_t r = 0; r < sizeof cache_rows / sizeof cache_rows[0] && y < H - 3; r++) {
             double sum_n = 0, sum_d = 0;
@@ -598,30 +607,28 @@ void ui_draw(struct snapshot *s)
             if (!avail && sum_n == 0) {
                 /* keep the bracket column so unavailable rows stay aligned */
                 P_putc(y, 10, AT_BOLD, '[');
-                P_putc(y, 10 + (Wc - 34) - 1, AT_BOLD, ']');
+                P_putc(y, 10 + SW - 1, AT_BOLD, ']');
                 P_print(y, 12, AT_DIM,
-                        "event not exposed on this PMU (virtualized instance?)");
+                        "counter not available on this machine");
                 y++;
                 continue;
             }
-            draw_heat(y, 10, Wc - 34, strip, n, 0, cache_rows[r].hi);
-            double agg;
-            char txt[64];
+            draw_heat(y, 10, SW, strip, n, 0, cache_rows[r].hi);
+            fmt_rate(sum_n, b1, sizeof b1);
             if (cache_rows[r].den == EV__N) {
-                agg = sum_d > 0 ? sum_n / (sum_d / 1000.0) : 0;
-                fmt_rate(sum_n, b1, sizeof b1);
-                snprintf(txt, sizeof txt, "%6.2f avg  %s/s", agg, b1);
+                double agg = sum_d > 0 ? sum_n / (sum_d / 1000.0) : 0;
+                P_print(y, TX, 0, "%.2f misses per 1k instructions (%s/s)",
+                        agg, b1);
             } else {
-                agg = sum_d > 0 ? sum_n / sum_d * 100.0 : 0;
-                fmt_rate(sum_n, b1, sizeof b1);
-                snprintf(txt, sizeof txt, "%5.1f%% avg  %s/s", agg, b1);
+                double agg = sum_d > 0 ? sum_n / sum_d * 100.0 : 0;
+                P_print(y, TX, 0, "%.1f%% %s (%s misses/s)",
+                        agg, cache_rows[r].what, b1);
             }
-            P_print(y, Wc - 23, 0, "%22s", txt);
             y++;
         }
-        P_print(y++, 0, AT_DIM, "IPC %.2f   L2 events: %s%s",
+        P_print(y++, 0, AT_DIM, "IPC %.2f (instructions per cycle)   L2 counters: %s%s",
                 cyc_tot > 0 ? instr_tot / cyc_tot : 0, s->l2_desc,
-                scaled > 0 ? "   (some counters multiplexed)" : "");
+                scaled > 0 ? "   (counters time-shared, values scaled)" : "");
     }
 
     /* ---- TLB / IPI section ---- */
@@ -634,9 +641,9 @@ void ui_draw(struct snapshot *s)
             if (strip[i] > mx) mx = strip[i];
         }
         P_print(y, 0, CP_LABEL, "recv/CPU ");
-        draw_heat(y, 10, Wc - 34, strip, n, 0, mx);
+        draw_heat(y, 10, SW, strip, n, 0, mx);
         fmt_rate(s->proc.tlb_recv_tot, b1, sizeof b1);
-        P_print(y, Wc - 23, 0, "%14s/s total", b1);
+        P_print(y, TX, 0, "%s shootdown IPIs received/s", b1);
         y++;
 
         if (s->trace_ok && y < H - 3) {
@@ -648,9 +655,9 @@ void ui_draw(struct snapshot *s)
                 if (strip[i] > sm) sm = strip[i];
             }
             P_print(y, 0, CP_LABEL, "send/CPU ");
-            draw_heat(y, 10, Wc - 34, strip, n, 0, sm);
+            draw_heat(y, 10, SW, strip, n, 0, sm);
             fmt_rate(tot, b1, sizeof b1);
-            P_print(y, Wc - 23, 0, "%14s/s total", b1);
+            P_print(y, TX, 0, "%s flushes initiated/s", b1);
             y++;
         }
         if (y < H - 3) {

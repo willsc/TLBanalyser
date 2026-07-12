@@ -11,6 +11,7 @@
 #include <sys/syscall.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
+#include <sys/mount.h>
 #include <pthread.h>
 #include <linux/perf_event.h>
 
@@ -266,10 +267,17 @@ static void close_channel(struct trace_state *ts, int ch)
 
 struct trace_state *trace_open(int ncpu, char *errbuf, size_t errlen)
 {
+    /* minimal images often boot without tracefs mounted; fix it ourselves */
+    if (access("/sys/kernel/tracing/events", F_OK) != 0 &&
+        access("/sys/kernel/debug/tracing/events", F_OK) != 0 &&
+        geteuid() == 0)
+        mount("tracefs", "/sys/kernel/tracing", "tracefs", 0, NULL);
+
     int tp_id = tp_read_int("id", -1);
     if (tp_id < 0) {
-        snprintf(errbuf, errlen, "tlb:tlb_flush tracepoint not found "
-                 "(mount tracefs, needs CONFIG_X86 mmu tracepoints)");
+        snprintf(errbuf, errlen, "tlb:tlb_flush tracepoint not found - "
+                 "tracefs missing or inaccessible (container?); try: "
+                 "mount -t tracefs tracefs /sys/kernel/tracing");
         return NULL;
     }
     struct trace_state *ts = calloc(1, sizeof *ts);

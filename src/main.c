@@ -3,7 +3,9 @@
 #include <getopt.h>
 #include <signal.h>
 #include <time.h>
+#include <limits.h>
 #include <ncurses.h>
+#include <term.h>
 
 static volatile sig_atomic_t g_stop;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
@@ -29,6 +31,57 @@ static void usage(const char *argv0)
            "Needs root (or CAP_PERFMON + CAP_SYS_ADMIN) for PMU counters and the\n"
            "tlb:tlb_flush tracepoint. /proc counters degrade gracefully without.\n",
            TLBA_VERSION, argv0);
+}
+
+/*
+ * Minimal server images sometimes lack a terminfo database (or ship an
+ * ncurses whose compiled-in path is empty).  Probe with setupterm() - which
+ * reports failure instead of exiting - and fall back to the terminfo entries
+ * bundled next to the binary, then to progressively simpler $TERM values.
+ * Returns false only if no usable terminal description exists at all.
+ */
+static bool terminfo_setup(void)
+{
+    int err;
+    if (setupterm(NULL, STDOUT_FILENO, &err) == OK) {
+        del_curterm(cur_term);
+        return true;
+    }
+
+    char exe[PATH_MAX], dirs[PATH_MAX * 2];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof exe - 1);
+    if (n > 0) {
+        exe[n] = 0;
+        char *slash = strrchr(exe, '/');
+        if (slash) *slash = 0;
+        snprintf(dirs, sizeof dirs,
+                 "%s/terminfo:/etc/terminfo:/lib/terminfo:/usr/share/terminfo", exe);
+        char tinfo[PATH_MAX + 16];
+        snprintf(tinfo, sizeof tinfo, "%s/terminfo", exe);
+        setenv("TERMINFO", tinfo, 1);
+        setenv("TERMINFO_DIRS", dirs, 1);
+        if (setupterm(NULL, STDOUT_FILENO, &err) == OK) {
+            del_curterm(cur_term);
+            return true;
+        }
+    }
+
+    static const char *fallback[] = { "xterm-256color", "xterm", "vt100" };
+    for (size_t i = 0; i < sizeof fallback / sizeof fallback[0]; i++) {
+        setenv("TERM", fallback[i], 1);
+        if (setupterm(NULL, STDOUT_FILENO, &err) == OK) {
+            del_curterm(cur_term);
+            fprintf(stderr, "tlbanalyser: no terminfo for your terminal, "
+                    "falling back to TERM=%s\n", fallback[i]);
+            return true;
+        }
+    }
+    fprintf(stderr,
+        "tlbanalyser: no terminfo database found - TUI unavailable.\n"
+        "  install one:  apt-get install ncurses-base ncurses-term\n"
+        "  or keep the bundled ./terminfo directory next to the binary,\n"
+        "  or use batch mode (no terminal needed):  tlbanalyser -b -d 5\n");
+    return false;
 }
 
 static void batch_print(struct snapshot *s, int top)
@@ -115,6 +168,8 @@ int main(int argc, char **argv)
     }
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+
+    if (!batch && !terminfo_setup()) return 1;
 
     static struct topology topo;
     topology_read(&topo);

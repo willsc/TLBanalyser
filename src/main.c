@@ -6,11 +6,31 @@
 #include <limits.h>
 #include <fcntl.h>
 #include <sys/wait.h>
+#include <sys/resource.h>
 #include <ncurses.h>
 #include <term.h>
 
 static volatile sig_atomic_t g_stop;
 static void on_signal(int sig) { (void)sig; g_stop = 1; }
+
+/*
+ * ~11 perf fds per CPU (9 PMU counters + 2 trace channels): a 192-CPU EPYC
+ * needs >2000 descriptors, far beyond the usual 1024 soft limit.  Without
+ * this, opens past the limit fail quietly and counters/attribution appear
+ * "unavailable" on exactly the biggest machines.
+ */
+static void raise_nofile(int ncpu)
+{
+    struct rlimit rl;
+    rlim_t need = (rlim_t)ncpu * (EV__N + 3) + 512;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0 || rl.rlim_cur >= need) return;
+    if (rl.rlim_max < need && geteuid() == 0) rl.rlim_max = need;
+    rl.rlim_cur = rl.rlim_max < need ? rl.rlim_max : need;
+    if (setrlimit(RLIMIT_NOFILE, &rl) != 0)
+        fprintf(stderr, "tlbanalyser: warning: cannot raise fd limit to %lu "
+                "(now %lu) - some per-CPU counters may not open\n",
+                (unsigned long)need, (unsigned long)rl.rlim_cur);
+}
 
 static double now_s(void)
 {
@@ -148,22 +168,31 @@ static void batch_print(struct snapshot *s, int top)
                    (unsigned long)s->origins[i].cnt);
         }
         printf("\n");
-        if (s->reason_tot[R_REMOTE_SEND] > 0) {
+        bool ipi = s->reason_tot[R_REMOTE_SEND] > 0;
+        double total = ipi ? (double)s->reason_tot[R_REMOTE_SEND]
+            : (double)(s->reason_tot[R_REMOTE_RECV] + s->reason_tot[R_LOCAL] +
+                       s->reason_tot[R_LOCAL_MM] + s->reason_tot[R_WRONG_CPU]);
+        if (total >= 1) {
             struct pid_stat *tp = NULL;
-            for (int i = 0; i < s->npid; i++)
-                if (!tp || s->pids[i].cnt[R_REMOTE_SEND] > tp->cnt[R_REMOTE_SEND])
-                    tp = &s->pids[i];
-            if (tp && tp->cnt[R_REMOTE_SEND] > 0) {
+            uint64_t tm = 0;
+            for (int i = 0; i < s->npid; i++) {
+                struct pid_stat *p = &s->pids[i];
+                uint64_t m = ipi ? p->cnt[R_REMOTE_SEND]
+                    : p->cnt[R_REMOTE_RECV] + p->cnt[R_LOCAL] +
+                      p->cnt[R_LOCAL_MM] + p->cnt[R_WRONG_CPU];
+                if (m > tm) { tm = m; tp = p; }
+            }
+            if (tp) {
                 uint32_t bs = 0;
                 uint64_t bc = 0;
                 for (int k = 0; k < 4; k++)
                     if (tp->origin_cnt[k] > bc) { bc = tp->origin_cnt[k]; bs = tp->origin_sym[k]; }
                 const char *sym = bs ? trace_symname(s->ts, bs) : NULL;
                 const char *hint = sym ? origin_hint(sym) : NULL;
-                printf("assess: %s (pid %d) causes %.0f%% of IPI sends%s%s%s%s\n",
+                printf("assess: %s (pid %d) causes %.0f%% of %s%s%s%s%s\n",
                        tp->comm[0] ? tp->comm : "?", tp->pid,
-                       100.0 * (double)tp->cnt[R_REMOTE_SEND] /
-                           (double)s->reason_tot[R_REMOTE_SEND],
+                       100.0 * (double)tm / total,
+                       ipi ? "IPI sends" : "TLB flushes (no-IPI/broadcast host)",
                        sym ? " via " : "", sym ? sym : "",
                        hint ? " = " : "", hint ? hint : "");
             }
@@ -230,6 +259,7 @@ int main(int argc, char **argv)
 
     static struct topology topo;
     topology_read(&topo);
+    raise_nofile(topo.ncpu);
 
     static struct snapshot snap;
     snap.topo = &topo;

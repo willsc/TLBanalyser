@@ -709,27 +709,37 @@ void ui_draw(struct snapshot *s)
                 P_print(y, x, AT_DIM, "attribution offline (tracepoint unavailable); "
                         "IPI receive counts above remain exact");
             } else {
-                double sends = (double)s->reason_tot[R_REMOTE_SEND];
-                if (sends < 1) {
+                /* judge by IPI sends; if the host does no-IPI broadcast
+                 * invalidation (AMD INVLPGB), judge by flush events instead */
+                bool ipi = s->reason_tot[R_REMOTE_SEND] > 0;
+                double total = ipi ? (double)s->reason_tot[R_REMOTE_SEND]
+                    : (double)(s->reason_tot[R_REMOTE_RECV] + s->reason_tot[R_LOCAL] +
+                               s->reason_tot[R_LOCAL_MM] + s->reason_tot[R_WRONG_CPU]);
+                if (total < 1) {
                     P_print(y, x, AT_DIM,
-                            "no remote shootdown senders this interval "
-                            "(recv %.0f/s from earlier/foreign flushes)",
-                            s->proc.tlb_recv_tot);
+                            "no shootdown/flush activity this interval "
+                            "(recv %.0f IPIs/s)", s->proc.tlb_recv_tot);
                 } else {
                     struct pid_stat *top = NULL;
-                    for (int i = 0; i < s->npid; i++)
-                        if (!top || s->pids[i].cnt[R_REMOTE_SEND] > top->cnt[R_REMOTE_SEND])
-                            top = &s->pids[i];
-                    if (top && top->cnt[R_REMOTE_SEND] > 0) {
+                    uint64_t tm = 0;
+                    for (int i = 0; i < s->npid; i++) {
+                        struct pid_stat *p = &s->pids[i];
+                        uint64_t m = ipi ? p->cnt[R_REMOTE_SEND]
+                            : p->cnt[R_REMOTE_RECV] + p->cnt[R_LOCAL] +
+                              p->cnt[R_LOCAL_MM] + p->cnt[R_WRONG_CPU];
+                        if (m > tm) { tm = m; top = p; }
+                    }
+                    if (top) {
                         uint32_t bs = 0;
                         uint64_t bc = 0;
                         for (int k = 0; k < 4; k++)
                             if (top->origin_cnt[k] > bc) { bc = top->origin_cnt[k]; bs = top->origin_sym[k]; }
                         const char *sym = bs ? trace_symname(s->ts, bs) : NULL;
                         const char *hint = sym ? origin_hint(sym) : NULL;
-                        x = P_print(y, x, AT_BOLD, "%s (pid %d) causes %.0f%% of IPI sends",
+                        x = P_print(y, x, AT_BOLD, "%s (pid %d) causes %.0f%% of %s",
                                     top->comm[0] ? top->comm : "?", top->pid,
-                                    100.0 * (double)top->cnt[R_REMOTE_SEND] / sends);
+                                    100.0 * (double)tm / total,
+                                    ipi ? "IPI sends" : "TLB flushes (no-IPI/broadcast host)");
                         if (sym)
                             P_print(y, x, 0, "  via %s%s%s%s", sym,
                                     hint ? " = " : "", hint ? hint : "",

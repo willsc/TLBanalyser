@@ -83,18 +83,28 @@ echo "$STORM" | tail -14 | sed 's/^/    | /'
 
 storm_recv=$(echo "$STORM" | awk '/tlb_recv_ipi/ {gsub(/[^0-9.]/,"",$2); if ($2>m) m=$2} END {printf "%d", m+0}')
 lost=$(echo "$STORM" | grep -o 'lost [0-9]*' | awk '{s+=$2} END {print s+0}')
-gen_send=$(echo "$STORM" | awk -v p="$GENPID" '$1==p {if ($3>m) m=$3} END {printf "%d", m+0}')
+# sender activity = SEND/s + LOCMM/s columns (covers IPI and no-IPI hosts)
+gen_send=$(echo "$STORM" | awk -v p="$GENPID" '$1==p {v=$3+$6; if (v>m) m=v} END {printf "%d", m+0}')
 gen_origin=$(echo "$STORM" | awk -v p="$GENPID" '$1==p {print $NF; exit}')
 
-if [ "${storm_recv:-0}" -gt $(( base_recv * 5 + 500 )) ]; then
+if grep -qw invlpgb /proc/cpuinfo; then
+    # broadcast-invalidation host: IPIs are not expected; judge by flush events
+    flushes=$(echo "$STORM" | grep -o -E '(send|localmm|recv)=[0-9]+' \
+              | awk -F= '{s+=$2} END {print s+0}')
+    if [ "${flushes:-0}" -gt 1000 ]; then
+        ok "flush events surged under load: ${flushes} in capture (INVLPGB host: IPI counters stay low by design)"
+    else
+        bad "expected a flush-event surge on this INVLPGB host, saw ${flushes:-0}"
+    fi
+elif [ "${storm_recv:-0}" -gt $(( base_recv * 5 + 500 )) ]; then
     ok "shootdown IPIs surged under load: ${base_recv}/s -> ${storm_recv}/s (/proc/interrupts, exact)"
 else
     bad "expected an IPI surge, got ${base_recv}/s -> ${storm_recv}/s"
 fi
 if [ "${gen_send:-0}" -gt 100 ]; then
-    ok "shootgen (pid $GENPID) attributed as sender at ${gen_send} sends/s"
+    ok "shootgen (pid $GENPID) attributed at ${gen_send} flush events/s"
 else
-    bad "shootgen (pid $GENPID) not attributed as a top sender (got '${gen_send:-none}')"
+    bad "shootgen (pid $GENPID) not attributed as a top flusher (got '${gen_send:-none}')"
 fi
 if [ -n "${gen_origin:-}" ] && [ "$gen_origin" != "-" ]; then
     ok "kernel origin resolved for shootgen: $gen_origin"

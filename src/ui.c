@@ -32,7 +32,16 @@ static struct {
     bool help;
     int  cpu_view;      /* 0 auto, 1 force meters, 2 force compact strip */
     bool cumulative;    /* show cumulative counts in table */
+    bool show_all;      /* include tasks with no flush activity */
 } st;
+
+/* flush activity = everything except benign context-switch flushes */
+static uint64_t flush_activity(const struct pid_stat *p, bool cumulative)
+{
+    const uint64_t *v = cumulative ? p->cum : p->cnt;
+    return v[R_REMOTE_SEND] + v[R_LOCAL] + v[R_LOCAL_MM] +
+           v[R_REMOTE_RECV] + v[R_WRONG_CPU];
+}
 
 static bool ansi;
 
@@ -306,6 +315,7 @@ int ui_key(int ch)
     case 'p': case ' ': st.paused = !st.paused; break;
     case 'h': case '?': case KEY_F(1): st.help = !st.help; break;
     case 'm': st.cpu_view = (st.cpu_view + 1) % 3; break;
+    case 'z': st.show_all = !st.show_all; break;
     case 'c': st.cumulative = !st.cumulative; break;
     case 's': case KEY_F(5): st.sort = (st.sort + 1) % SORT__N; break;
     case KEY_UP:    if (st.scroll > 0) st.scroll--; break;
@@ -445,17 +455,17 @@ static void draw_help(void)
         "  L1/L2       per-CPU PMU counters; L2 uses vendor raw events",
         "",
         "TABLE COLUMNS (per second unless cumulative view, key 'c')",
-        "  SEND    remote shootdown IPIs this task initiated  <- culprit",
+        "  SEND    remote shootdowns this task initiated  <- the culprit",
         "  PAGES   pages invalidated by those sends (0 pages = full flush)",
-        "  LOCAL/LOCMM  local-only flushes (no IPI to other CPUs)",
+        "  LOCAL   local-only flushes (own CPU, no shootdown)",
+        "  RECV    shootdowns that interrupted this task (victim, not cause)",
         "  SWTCH   lazy-TLB flushes at context switch (benign)",
-        "  RECV    IPIs that interrupted this task (victim, not cause)",
-        "  ORIGIN  kernel function that triggered the flush, e.g.:",
-        "          unmap_region=munmap  madvise_*=allocator MADV_DONTNEED/FREE",
-        "          shrink_folio_list=memory reclaim  migrate_pages*=migration",
-        "          collapse_huge_page/khugepaged=THP  zap_page_range=exit/free",
+        "  %FL     this task's share of all flush activity",
+        "  WHY     kernel function behind the flushes + plain-English meaning",
         "",
-        "KEYS  s/F5 sort   c cumulative   p pause   m CPU view (auto/bars/strip)",
+        "Tasks with no flush activity are hidden by default (press z).",
+        "",
+        "KEYS  s/F5 sort   c cumulative   z show all   p pause   m CPU view",
         "      r reset cumulative   arrows/PgUp/PgDn scroll   q quit",
         "",
         "                      press h to close",
@@ -784,60 +794,82 @@ void ui_draw(struct snapshot *s)
     }
     if (s->trace_ok && y < H - 1) {
         char hb[G_MAXC + 1];
-        snprintf(hb, sizeof hb, "%7s %-16s %8s %9s %8s %8s %8s %8s  %-24s",
+        snprintf(hb, sizeof hb, "%7s %-16s %8s %9s %8s %8s %8s %5s  %-40s",
                  "PID", "COMM", st.cumulative ? "SEND" : "SEND/s",
                  st.cumulative ? "PAGES" : "PAGES/s",
-                 "LOCAL", "LOCMM", "SWTCH", "RECV", "ORIGIN");
+                 "LOCAL", "RECV", "SWTCH", "%FL", "WHY (kernel origin)");
         for (int i = 0; i < W; i++)
             P_putc(y, i, CP_TABHDR, i < (int)strlen(hb) ? hb[i] : ' ');
         y++;
 
         qsort(s->pids, s->npid, sizeof s->pids[0], row_cmp);
-        int rows_avail = H - 1 - y;
-        int max_scroll = s->npid > rows_avail ? s->npid - rows_avail : 0;
+
+        /* hide the noise: only tasks with real flush activity, unless 'z' */
+        static struct pid_stat *fr[512];
+        int nf = 0, hidden = 0;
+        uint64_t grand = 0;
+        for (int i = 0; i < s->npid; i++) {
+            uint64_t act = flush_activity(&s->pids[i], st.cumulative);
+            grand += act;
+            if (act > 0 || st.show_all) fr[nf++] = &s->pids[i];
+            else hidden++;
+        }
+        if (!grand) grand = 1;
+
+        int rows_avail = H - 2 - y;
+        int max_scroll = nf > rows_avail ? nf - rows_avail : 0;
         if (st.scroll > max_scroll) st.scroll = max_scroll;
 
-        for (int i = st.scroll; i < s->npid && y < H - 1; i++, y++) {
-            struct pid_stat *p = &s->pids[i];
-            char c1[16], c2[16], c3[16], c4[16], c5[16], c6[16];
+        for (int i = st.scroll; i < nf && y < H - 2; i++, y++) {
+            struct pid_stat *p = fr[i];
+            char c1[16], c2[16], c3[16], c5[16], c6[16];
             if (st.cumulative) {
                 fmt_count(p->cum[R_REMOTE_SEND], c1, sizeof c1);
                 fmt_count(p->pages_cum, c2, sizeof c2);
-                fmt_count(p->cum[R_LOCAL], c3, sizeof c3);
-                fmt_count(p->cum[R_LOCAL_MM], c4, sizeof c4);
-                fmt_count(p->cum[R_TASK_SWITCH], c5, sizeof c5);
+                fmt_count(p->cum[R_LOCAL] + p->cum[R_LOCAL_MM], c3, sizeof c3);
                 fmt_count(p->cum[R_REMOTE_RECV], c6, sizeof c6);
+                fmt_count(p->cum[R_TASK_SWITCH], c5, sizeof c5);
             } else {
                 fmt_rate(p->cnt[R_REMOTE_SEND] / s->dt, c1, sizeof c1);
                 fmt_rate(p->pages / s->dt, c2, sizeof c2);
-                fmt_rate(p->cnt[R_LOCAL] / s->dt, c3, sizeof c3);
-                fmt_rate(p->cnt[R_LOCAL_MM] / s->dt, c4, sizeof c4);
-                fmt_rate(p->cnt[R_TASK_SWITCH] / s->dt, c5, sizeof c5);
+                fmt_rate((p->cnt[R_LOCAL] + p->cnt[R_LOCAL_MM]) / s->dt, c3, sizeof c3);
                 fmt_rate(p->cnt[R_REMOTE_RECV] / s->dt, c6, sizeof c6);
+                fmt_rate(p->cnt[R_TASK_SWITCH] / s->dt, c5, sizeof c5);
             }
-            /* dominant origin */
+            uint64_t act = flush_activity(p, st.cumulative);
+            /* dominant origin, with its plain-English meaning inline */
             uint32_t best = 0;
             uint64_t bc = 0;
             for (int k = 0; k < 4; k++)
                 if (p->origin_cnt[k] > bc) { bc = p->origin_cnt[k]; best = p->origin_sym[k]; }
+            char why[96] = "-";
+            if (act > 0 && best) {
+                const char *sym = trace_symname(s->ts, best);
+                const char *hint = origin_hint(sym);
+                if (hint) snprintf(why, sizeof why, "%s = %s", sym, hint);
+                else snprintf(why, sizeof why, "%s", sym);
+            }
             char comm[COMM_LEN + 3];
             snprintf(comm, sizeof comm, p->kthread ? "[%s]" : "%s", p->comm);
             bool hot = (st.cumulative ? p->cum[R_REMOTE_SEND] : p->cnt[R_REMOTE_SEND]) > 0;
-            uint64_t tot = 0;
-            for (int r = 0; r < REASON_MAX; r++)
-                tot += st.cumulative ? p->cum[r] : p->cnt[r];
-            unsigned at = hot ? AT_BOLD : (tot == 0 ? AT_DIM : 0);
-            P_print(y, 0, at, "%7d %-16.16s %8s %9s %8s %8s %8s %8s  %-24.24s",
-                    p->pid, comm, c1, c2, c3, c4, c5, c6,
-                    best ? trace_symname(s->ts, best) : "-");
+            unsigned at = hot ? AT_BOLD : (act == 0 ? AT_DIM : 0);
+            P_print(y, 0, at, "%7d %-16.16s %8s %9s %8s %8s %8s %4.0f%%  %-40.40s",
+                    p->pid, comm, c1, c2, c3, c6, c5,
+                    100.0 * (double)act / (double)grand, why);
         }
+        if (hidden > 0 && y < H - 1)
+            P_print(y++, 0, AT_DIM,
+                    "  (+%d tasks with no flush activity hidden - press z to show)",
+                    hidden);
+        else if (nf == 0 && y < H - 1)
+            P_print(y++, 2, AT_DIM, "(no flushing tasks this interval)");
     }
 
     /* ---- key bar ---- */
     {
         static const struct { const char *k, *lab; } keys[] = {
-            { "F1", "Help" }, { "F5", "Sort" }, { "c", "Cumul" }, { "p", "Pause" },
-            { "m", "Grid" }, { "r", "Reset" }, { "q", "Quit" },
+            { "F1", "Help" }, { "F5", "Sort" }, { "c", "Cumul" }, { "z", "All" },
+            { "p", "Pause" }, { "m", "Grid" }, { "r", "Reset" }, { "q", "Quit" },
         };
         int x = 0;
         for (size_t i = 0; i < sizeof keys / sizeof keys[0]; i++) {

@@ -202,19 +202,23 @@ static void batch_print(struct snapshot *s, int top)
         int shown = 0;
         for (int i = 0; i < s->npid && shown < top; i++) {
             struct pid_stat *p = &s->pids[i];
-            uint64_t tot = 0;
-            for (int r = 0; r < REASON_MAX; r++) tot += p->cnt[r];
-            if (!tot) continue;
+            uint64_t act = p->cnt[R_REMOTE_SEND] + p->cnt[R_LOCAL] +
+                           p->cnt[R_LOCAL_MM] + p->cnt[R_REMOTE_RECV] +
+                           p->cnt[R_WRONG_CPU];
+            if (!act) continue;
             uint32_t best = 0;
             uint64_t bc = 0;
             for (int k = 0; k < 4; k++)
                 if (p->origin_cnt[k] > bc) { bc = p->origin_cnt[k]; best = p->origin_sym[k]; }
-            printf("%7d %-16.16s %8.0f %9.0f %7.0f %7.0f %7.0f %7.0f  %s\n",
+            const char *sym = best ? trace_symname(s->ts, best) : NULL;
+            const char *hint = sym ? origin_hint(sym) : NULL;
+            printf("%7d %-16.16s %8.0f %9.0f %7.0f %7.0f %7.0f %7.0f  %s%s%s%s\n",
                    p->pid, p->comm,
                    p->cnt[R_REMOTE_SEND] / s->dt, p->pages / s->dt,
                    p->cnt[R_LOCAL] / s->dt, p->cnt[R_LOCAL_MM] / s->dt,
                    p->cnt[R_TASK_SWITCH] / s->dt, p->cnt[R_REMOTE_RECV] / s->dt,
-                   best ? trace_symname(s->ts, best) : "-");
+                   sym ? sym : "-", hint ? " = " : "", hint ? hint : "",
+                   p->kthread ? " [kthread]" : "");
             shown++;
         }
     } else {

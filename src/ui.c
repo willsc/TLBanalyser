@@ -11,6 +11,8 @@
 #include <termios.h>
 #include <poll.h>
 #include <unistd.h>
+#include <locale.h>
+#include <langinfo.h>
 #include <sys/ioctl.h>
 
 enum { CP_LABEL = 1, CP_USER, CP_SYS, CP_IRQ, CP_SOFTIRQ, CP_NICE,
@@ -44,12 +46,14 @@ static uint64_t flush_activity(const struct pid_stat *p, bool cumulative)
 }
 
 static bool ansi;
+static bool utf8;
 
 /* ================= ANSI grid backend ================= */
 
 #define G_MAXR 200
 #define G_MAXC 500
-static struct cell { char ch; unsigned char at; } grid[G_MAXR][G_MAXC];
+/* a cell holds one displayed character, possibly multi-byte (UTF-8) */
+static struct cell { char ch[5]; unsigned char at; } grid[G_MAXR][G_MAXC];
 static int g_rows = 24, g_cols = 80;
 static struct termios g_tio_save;
 static bool g_tio_saved;
@@ -81,7 +85,8 @@ static void g_clear(void)
 {
     for (int y = 0; y < g_rows; y++)
         for (int x = 0; x < g_cols; x++) {
-            grid[y][x].ch = ' ';
+            grid[y][x].ch[0] = ' ';
+            grid[y][x].ch[1] = 0;
             grid[y][x].at = 0;
         }
 }
@@ -96,7 +101,8 @@ static void g_emit(void)
     for (int y = 0; y < g_rows; y++) {
         o += (size_t)snprintf(g_out + o, sizeof g_out - o, "\x1b[%d;1H", y + 1);
         int last = g_cols - 1;
-        while (last > 0 && grid[y][last].ch == ' ' && grid[y][last].at == 0) last--;
+        while (last > 0 && grid[y][last].ch[0] == ' ' && !grid[y][last].ch[1] &&
+               grid[y][last].at == 0) last--;
         for (int x = 0; x <= last && o < sizeof g_out - 24; x++) {
             unsigned at = grid[y][x].at;
             if (at != cur) {
@@ -111,7 +117,7 @@ static void g_emit(void)
                 g_out[o++] = 'm';
                 cur = at;
             }
-            g_out[o++] = grid[y][x].ch;
+            for (const char *c = grid[y][x].ch; *c; c++) g_out[o++] = *c;
         }
         if (cur != 0) {
             o += (size_t)snprintf(g_out + o, sizeof g_out - o, "\x1b[0m");
@@ -140,12 +146,28 @@ static void P_putc(int y, int x, unsigned at, char ch)
 {
     if (y < 0 || x < 0 || y >= P_rows() || x >= P_cols()) return;
     if (ansi) {
-        grid[y][x].ch = ch;
+        grid[y][x].ch[0] = ch;
+        grid[y][x].ch[1] = 0;
         grid[y][x].at = (unsigned char)at;
     } else {
         attr_t a = nc_attr(at);
         attron(a);
         mvaddch(y, x, (chtype)ch);
+        attroff(a);
+    }
+}
+
+/* place one displayed character that may be a multi-byte UTF-8 glyph */
+static void P_putg(int y, int x, unsigned at, const char *glyph)
+{
+    if (y < 0 || x < 0 || y >= P_rows() || x >= P_cols()) return;
+    if (ansi) {
+        snprintf(grid[y][x].ch, sizeof grid[y][x].ch, "%s", glyph);
+        grid[y][x].at = (unsigned char)at;
+    } else {
+        attr_t a = nc_attr(at);
+        attron(a);
+        mvaddstr(y, x, glyph);
         attroff(a);
     }
 }
@@ -164,7 +186,8 @@ static int P_print(int y, int x, unsigned at, const char *fmt, ...)
         for (int i = 0; i < len; i++) {
             int xx = x + i;
             if (xx < 0 || xx >= g_cols) continue;
-            grid[y][xx].ch = buf[i];
+            grid[y][xx].ch[0] = buf[i];
+            grid[y][xx].ch[1] = 0;
             grid[y][xx].at = (unsigned char)at;
         }
     } else {
@@ -212,6 +235,8 @@ static void P_frame_end(void)
 void ui_init(bool use_ansi)
 {
     ansi = use_ansi;
+    setlocale(LC_ALL, "");
+    utf8 = strstr(nl_langinfo(CODESET), "UTF-8") != NULL;
     if (ansi) {
         if (tcgetattr(STDIN_FILENO, &g_tio_save) == 0) {
             g_tio_saved = true;
@@ -379,7 +404,13 @@ static void draw_cpu_meter(int y, int x, int w, int cpu, const struct cpu_load *
     P_print(y, x + 4 + inner - (int)strlen(pct), AT_DIM, "%s", pct);
 }
 
-/* heat strip: one cell per CPU (or aggregated), colored by value/max */
+/* vertical-bar block elements: a real bar chart, one column per cell */
+static const char *heat_blocks[9] =
+    { " ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█" };
+static const char *heat_ascii[9] =
+    { " ", ".", ":", "-", "=", "+", "*", "#", "@" };
+
+/* heat strip: one cell per CPU (or aggregated), height+color = value/max */
 static void draw_heat(int y, int x, int w, const double *val, int n, double lo, double hi)
 {
     P_putc(y, x, AT_BOLD, '[');
@@ -389,7 +420,7 @@ static void draw_heat(int y, int x, int w, const double *val, int n, double lo, 
     int per = (n + cells - 1) / cells;        /* CPUs per cell */
     if (per < 1) per = 1;
     int used = (n + per - 1) / per;
-    static const char glyph[] = " .:-=+*#%@";
+    const char **glyph = utf8 ? heat_blocks : heat_ascii;
     for (int c = 0; c < used; c++) {
         double m = 0;
         for (int i = c * per; i < (c + 1) * per && i < n; i++)
@@ -397,12 +428,25 @@ static void draw_heat(int y, int x, int w, const double *val, int n, double lo, 
         double f = hi > lo ? (m - lo) / (hi - lo) : 0;
         if (f < 0) f = 0;
         if (f > 1) f = 1;
-        int g = (int)(f * 9.0);
+        int g = (int)ceil(f * 8.0);
+        if (g > 8) g = 8;
         unsigned at = (f < 0.4 ? CP_HEAT_LO : f < 0.75 ? CP_HEAT_MID : CP_HEAT_HI) |
-                      (g >= 7 ? AT_BOLD : 0);
-        P_putc(y, x + 1 + c, at, glyph[g]);
+                      (f >= 0.75 ? AT_BOLD : 0);
+        P_putg(y, x + 1 + c, at, glyph[g]);
     }
     P_putc(y, x + 1 + cells, AT_BOLD, ']');
+}
+
+/* one-line explanation of the strips, e.g. "CPU0 left..CPU191 right, 2 CPUs/cell" */
+static void strip_legend(int y, int n, int sw)
+{
+    int cells = sw - 2 < n ? sw - 2 : n;
+    int per = cells > 0 ? (n + cells - 1) / cells : 1;
+    P_print(y, 0, AT_DIM,
+            "strips: CPU0 at left, CPU%d at right, %d CPU%s per cell;  "
+            "bar height %s and color (green%sred) = value", n - 1, per,
+            per > 1 ? "s" : "", utf8 ? "▁..█" : ". .. @",
+            utf8 ? "→" : "->");
 }
 
 static void section(int y, const char *title)
@@ -551,11 +595,7 @@ void ui_draw(struct snapshot *s)
     } else {
         static double busy[MAX_CPUS];
         for (int i = 0; i < n; i++) busy[i] = s->proc.load[i].busy;
-        int cells = SW - 2 < n ? SW - 2 : n;
-        int per = cells > 0 ? (n + cells - 1) / cells : 1;
-        P_print(y++, 0, AT_DIM, "strips below: CPU0 at left, CPU%d at right, "
-                "%d CPU%s per cell;  ' '=zero  '.'=low  '@'=high", n - 1, per,
-                per > 1 ? "s" : "");
+        strip_legend(y++, n, SW);
         P_print(y, 0, CP_LABEL, "CPU busy ");
         double avg = 0;
         for (int i = 0; i < n; i++) avg += busy[i];
@@ -568,13 +608,7 @@ void ui_draw(struct snapshot *s)
     /* ---- CACHE section (only when the PMU delivers) ---- */
     if (s->pmu_ok) {
         if (y < H - 3) section(y++, "CACHE / TLB MISSES  (per-CPU PMU)");
-        if (!compact && y < H - 3) {
-            int cells = SW - 2 < n ? SW - 2 : n;
-            int per = cells > 0 ? (n + cells - 1) / cells : 1;
-            P_print(y++, 0, AT_DIM, "strips: CPU0 at left, CPU%d at right, "
-                    "%d CPU%s per cell;  ' '=zero  '.'=low  '@'=high",
-                    n - 1, per, per > 1 ? "s" : "");
-        }
+        if (!compact && y < H - 3) strip_legend(y++, n, SW);
         static double strip[MAX_CPUS];
         double instr_tot = 0, cyc_tot = 0, scaled = 0;
         for (int i = 0; i < n; i++) {

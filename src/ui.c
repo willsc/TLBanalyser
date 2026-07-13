@@ -568,6 +568,13 @@ void ui_draw(struct snapshot *s)
     /* ---- CACHE section (only when the PMU delivers) ---- */
     if (s->pmu_ok) {
         if (y < H - 3) section(y++, "CACHE / TLB MISSES  (per-CPU PMU)");
+        if (!compact && y < H - 3) {
+            int cells = SW - 2 < n ? SW - 2 : n;
+            int per = cells > 0 ? (n + cells - 1) / cells : 1;
+            P_print(y++, 0, AT_DIM, "strips: CPU0 at left, CPU%d at right, "
+                    "%d CPU%s per cell;  ' '=zero  '.'=low  '@'=high",
+                    n - 1, per, per > 1 ? "s" : "");
+        }
         static double strip[MAX_CPUS];
         double instr_tot = 0, cyc_tot = 0, scaled = 0;
         for (int i = 0; i < n; i++) {
